@@ -5,7 +5,7 @@ constexpr size_t kSerialCommandBufferSize = 160;
 String serialLine;
 bool promptShown = false;
 }  // namespace
-y
+
 void printPrompt(Stream &out) {
     out.print("os>");
     promptShown = true;
