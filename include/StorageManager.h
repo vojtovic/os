@@ -11,3 +11,4 @@ void printFsInfo(const SystemState &state, Stream &out = Serial);
 void printSdInfo(const SystemState &state, Stream &out = Serial);
 void listLittleFs(const SystemState &state, const String &path, Stream &out = Serial);
 void listSd(const SystemState &state, const String &path, Stream &out = Serial);
+size_t loadSdAppManifest(const SystemState &state, String *appIds, size_t maxApps, Stream &out = Serial);

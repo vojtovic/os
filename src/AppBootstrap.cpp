@@ -6,6 +6,49 @@
 #include "SerialShell.h"
 #include "StorageManager.h"
 
+namespace {
+void processCardKbInput(SystemState &state, Stream &out) {
+    static uint32_t lastKeyMs = 0;
+    static char lastKey = 0;
+
+    char ch = 0;
+    if (!tryReadCardKb(state, ch)) {
+        return;
+    }
+
+    const uint32_t nowMs = millis();
+    const bool duplicateBurst = (ch == lastKey) && (nowMs - lastKeyMs < 80);
+    if (duplicateBurst) {
+        return;
+    }
+
+    noteDisplayActivity();
+    wakeDisplaysOnInput(state, out);
+
+    if (handleActiveAppInput(state, ch, out)) {
+        lastKey = ch;
+        lastKeyMs = nowMs;
+        return;
+    }
+
+    out.print("kb key: 0x");
+    if (static_cast<uint8_t>(ch) < 16) {
+        out.print('0');
+    }
+    out.print(static_cast<uint8_t>(ch), HEX);
+    out.print(" '");
+    if (ch >= 32 && ch <= 126) {
+        out.print(ch);
+    } else {
+        out.print('.');
+    }
+    out.println("'");
+
+    lastKey = ch;
+    lastKeyMs = nowMs;
+}
+}  // namespace
+
 void setupApplication(SystemState &state, TaskManager &taskManager) {
     // Startup sekvence: serial -> filesystem -> SD.
     // To je zaklad, na ktery se pak da vrstvit GUI, konfig, logy nebo media.
@@ -57,6 +100,12 @@ void setupApplication(SystemState &state, TaskManager &taskManager) {
     if (state.buzzerReady) {
         testBuzzer(state, Serial, 1);
     }
+
+    if (state.cardKbReady) {
+        Serial.println("CardKB live logging: enabled");
+    }
+
+    renderLauncherScreen(state, Serial);
 }
 
 void processApplicationLoop(SystemState &state, TaskManager &taskManager) {
@@ -72,6 +121,13 @@ void processApplicationLoop(SystemState &state, TaskManager &taskManager) {
         lastHeartbeatMs = nowMs;
     }
 
+    processCardKbInput(state, Serial);
+
+    if (Serial.available() > 0) {
+        noteDisplayActivity();
+    }
+
     processSerialInput(state, taskManager, Serial);
+    handleEinkIdleTimeout(state, Serial);
     vTaskDelay(pdMS_TO_TICKS(10));
 }

@@ -10,6 +10,7 @@ constexpr int kSdMosi = 38;
 constexpr int kSdSck = 39;
 constexpr int kSdMiso = 40;
 constexpr int kSdCs = 46;
+constexpr const char *kSdAppsManifest = "/apps/apps.txt";
 
 SPIClass sdSpi(HSPI);
 }  // namespace
@@ -172,4 +173,32 @@ void listSd(const SystemState &state, const String &path, Stream &out) {
         entry = root.openNextFile();
     }
     root.close();
+}
+
+size_t loadSdAppManifest(const SystemState &state, String *appIds, size_t maxApps, Stream &out) {
+    if (!state.sdReady || appIds == nullptr || maxApps == 0) {
+        return 0;
+    }
+
+    File file = SD.open(kSdAppsManifest, FILE_READ);
+    if (!file) {
+        out.println("SD apps: manifest not found (/apps/apps.txt)");
+        return 0;
+    }
+
+    size_t count = 0;
+    while (file.available() && count < maxApps) {
+        String line = file.readStringUntil('\n');
+        line.trim();
+        if (line.isEmpty() || line.startsWith("#") || line.startsWith(";")) {
+            continue;
+        }
+
+        appIds[count++] = line;
+    }
+
+    file.close();
+    out.print("SD apps loaded: ");
+    out.println(count);
+    return count;
 }

@@ -9,6 +9,15 @@ String trimCopy(String value) {
     return value;
 }
 
+constexpr const char *kLauncherAppIds[] = {
+    "settings",
+    "apps",
+    "serial",
+    "about",
+};
+
+constexpr uint8_t kLauncherAppCount = sizeof(kLauncherAppIds) / sizeof(kLauncherAppIds[0]);
+
 bool parseBool(const String &value) {
     String normalized = value;
     normalized.toLowerCase();
@@ -91,6 +100,12 @@ void printShellHelp(Stream &out) {
     out.println("config set sd on|off");
     out.println("config set sd_speed <hz>");
     out.println("display info");
+    out.println("launcher show");
+    out.println("launcher next");
+    out.println("launcher prev");
+    out.println("launcher open <settings|apps|serial|about>");
+    out.println("launcher list");
+    out.println("settings show");
     out.println("oled test");
     out.println("eink test [text]");
     out.println("hw info");
@@ -165,6 +180,70 @@ bool executeShellCommand(SystemState &state, TaskManager &taskManager, const Str
     if (line == "display info") {
         out.println("--- Displays ---");
         printDisplayInfo(state, out);
+        return true;
+    }
+
+    if (line.startsWith("launcher")) {
+        String args = line.length() > 8 ? trimCopy(line.substring(8)) : String("");
+
+        if (args.isEmpty() || args == "show") {
+            renderLauncherScreen(state, out);
+            return true;
+        }
+
+        if (args == "list") {
+            printLauncherInfo(state, out);
+            return true;
+        }
+
+        if (args == "next" || args == "prev") {
+            const int direction = args == "next" ? 1 : -1;
+            int nextIndex = static_cast<int>(state.launcher.selectedIndex) + direction;
+            if (nextIndex < 0) {
+                nextIndex = kLauncherAppCount - 1;
+            }
+            if (nextIndex >= kLauncherAppCount) {
+                nextIndex = 0;
+            }
+            state.launcher.selectedIndex = static_cast<uint8_t>(nextIndex);
+            state.launcher.activeAppId = kLauncherAppIds[state.launcher.selectedIndex];
+            renderLauncherScreen(state, out);
+            return true;
+        }
+
+        if (args.startsWith("open ")) {
+            String appId = trimCopy(args.substring(5));
+            if (appId.isEmpty()) {
+                out.println("launcher open: missing app id");
+                return true;
+            }
+
+            bool found = false;
+            for (uint8_t index = 0; index < kLauncherAppCount; ++index) {
+                if (appId.equalsIgnoreCase(kLauncherAppIds[index])) {
+                    state.launcher.selectedIndex = index;
+                    state.launcher.activeAppId = kLauncherAppIds[index];
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                out.println("launcher open: unknown app id");
+                return true;
+            }
+
+            renderActiveApp(state, out);
+            return true;
+        }
+
+        out.println("launcher: unknown subcommand");
+        return true;
+    }
+
+    if (line == "settings show") {
+        state.launcher.activeAppId = "settings";
+        renderSettingsScreen(state, out);
         return true;
     }
 
