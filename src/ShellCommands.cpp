@@ -1,5 +1,8 @@
 #include "ShellCommands.h"
 
+#include "DisplayManager.h"
+#include "HardwareManager.h"
+
 namespace {
 String trimCopy(String value) {
     value.trim();
@@ -87,6 +90,14 @@ void printShellHelp(Stream &out) {
     out.println("config set name <value>");
     out.println("config set sd on|off");
     out.println("config set sd_speed <hz>");
+    out.println("display info");
+    out.println("oled test");
+    out.println("eink test [text]");
+    out.println("hw info");
+    out.println("hw scan");
+    out.println("hw beep [count]");
+    out.println("hw rtc");
+    out.println("kb read");
     out.println("reboot");
     out.println("prompt");
 }
@@ -148,6 +159,72 @@ bool executeShellCommand(SystemState &state, TaskManager &taskManager, const Str
 
     if (line.startsWith("config ")) {
         handleConfigCommand(state, trimCopy(line.substring(7)), out);
+        return true;
+    }
+
+    if (line == "display info") {
+        out.println("--- Displays ---");
+        printDisplayInfo(state, out);
+        return true;
+    }
+
+    if (line == "oled test") {
+        renderOledStatus(state, out);
+        return true;
+    }
+
+    if (line.startsWith("eink test")) {
+        String text = line.length() > 9 ? trimCopy(line.substring(9)) : String("E-ink test");
+        renderEinkMessage(state, text, false, out);
+        return true;
+    }
+
+    if (line == "hw info") {
+        out.println("--- Hardware ---");
+        printHardwareInfo(state, out);
+        return true;
+    }
+
+    if (line == "hw scan") {
+        scanI2cBus(out);
+        return true;
+    }
+
+    if (line == "hw rtc") {
+        printRtcNow(state, out);
+        return true;
+    }
+
+    if (line.startsWith("hw beep")) {
+        String arg = line.length() > 7 ? trimCopy(line.substring(7)) : String("");
+        uint8_t count = 2;
+        if (!arg.isEmpty()) {
+            const long parsed = arg.toInt();
+            if (parsed <= 0 || parsed > 10) {
+                out.println("hw beep: count must be 1..10");
+                return true;
+            }
+            count = static_cast<uint8_t>(parsed);
+        }
+        testBuzzer(state, out, count);
+        return true;
+    }
+
+    if (line == "kb read") {
+        char ch = 0;
+        if (tryReadCardKb(state, ch)) {
+            out.print("CardKB: 0x");
+            out.print(static_cast<uint8_t>(ch), HEX);
+            out.print(" '");
+            if (ch >= 32 && ch <= 126) {
+                out.print(ch);
+            } else {
+                out.print(".");
+            }
+            out.println("'");
+        } else {
+            out.println("CardKB: no key");
+        }
         return true;
     }
 

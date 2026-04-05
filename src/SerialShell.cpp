@@ -25,6 +25,8 @@ void processSerialInput(SystemState &state, TaskManager &taskManager, Stream &ou
         if (ch == '\n') {
             String line = serialLine;
             serialLine = "";
+            out.print("shell rx: ");
+            out.println(line);
             if (executeShellCommand(state, taskManager, line, out)) {
                 printPrompt(out);
             }

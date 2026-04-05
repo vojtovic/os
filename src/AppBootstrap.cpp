@@ -1,6 +1,8 @@
 #include "AppBootstrap.h"
 
 #include "AppTasks.h"
+#include "DisplayManager.h"
+#include "HardwareManager.h"
 #include "SerialShell.h"
 #include "StorageManager.h"
 
@@ -12,6 +14,9 @@ void setupApplication(SystemState &state, TaskManager &taskManager) {
 
     Serial.println("os project ready");
     printPrompt();
+
+    state.i2cReady = initHardware(state);
+    initDisplays(state);
 
     state.littleFsReady = initLittleFs(state);
     if (!state.littleFsReady) {
@@ -48,9 +53,25 @@ void setupApplication(SystemState &state, TaskManager &taskManager) {
     if (!taskManager.start()) {
         Serial.println("TaskManager: nektere tasky se nepodarilo spustit");
     }
+
+    if (state.buzzerReady) {
+        testBuzzer(state, Serial, 1);
+    }
 }
 
 void processApplicationLoop(SystemState &state, TaskManager &taskManager) {
+    static uint32_t lastHeartbeatMs = 0;
+    const uint32_t nowMs = millis();
+    if (nowMs - lastHeartbeatMs >= 2000) {
+        Serial.print("loop heartbeat ms=");
+        Serial.print(nowMs);
+        Serial.print(" core=");
+        Serial.print(xPortGetCoreID());
+        Serial.print(" heap=");
+        Serial.println(ESP.getFreeHeap());
+        lastHeartbeatMs = nowMs;
+    }
+
     processSerialInput(state, taskManager, Serial);
     vTaskDelay(pdMS_TO_TICKS(10));
 }
