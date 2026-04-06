@@ -27,6 +27,112 @@
 #include <pgmspace.h>
 #include "epdpaint.h"
 
+namespace {
+enum CzechDiacritic : uint8_t {
+    kDiaNone = 0,
+    kDiaAcute,
+    kDiaCaron,
+    kDiaRing,
+};
+
+void drawDiacriticMark(Paint *paint, int x, int y, sFONT *font, uint8_t diacritic, int colored) {
+    if (diacritic == kDiaNone) {
+        return;
+    }
+
+    const int mid = x + font->Width / 2;
+    const int top = y + 1;
+
+    if (diacritic == kDiaAcute) {
+        paint->DrawPixel(mid - 1, top + 1, colored);
+        paint->DrawPixel(mid, top, colored);
+        paint->DrawPixel(mid + 1, top - 1, colored);
+        return;
+    }
+
+    if (diacritic == kDiaCaron) {
+        paint->DrawPixel(mid - 2, top - 1, colored);
+        paint->DrawPixel(mid - 1, top, colored);
+        paint->DrawPixel(mid, top + 1, colored);
+        paint->DrawPixel(mid + 1, top, colored);
+        paint->DrawPixel(mid + 2, top - 1, colored);
+        return;
+    }
+
+    if (diacritic == kDiaRing) {
+        paint->DrawPixel(mid - 1, top, colored);
+        paint->DrawPixel(mid + 1, top, colored);
+        paint->DrawPixel(mid, top - 1, colored);
+        paint->DrawPixel(mid, top + 1, colored);
+    }
+}
+
+bool decodeUtf8CzechGlyph(const char *&text, char &baseAscii, uint8_t &diacritic) {
+    const uint8_t b0 = static_cast<uint8_t>(*text);
+    if (b0 == 0) {
+        return false;
+    }
+
+    diacritic = kDiaNone;
+    if (b0 < 0x80) {
+        baseAscii = static_cast<char>(b0);
+        ++text;
+        return true;
+    }
+
+    const uint8_t b1 = static_cast<uint8_t>(*(text + 1));
+
+    if (b0 == 0xC3) {
+        if (b1 == 0xA1) { baseAscii = 'a'; diacritic = kDiaAcute; text += 2; return true; }
+        if (b1 == 0x81) { baseAscii = 'A'; diacritic = kDiaAcute; text += 2; return true; }
+        if (b1 == 0xA9) { baseAscii = 'e'; diacritic = kDiaAcute; text += 2; return true; }
+        if (b1 == 0x89) { baseAscii = 'E'; diacritic = kDiaAcute; text += 2; return true; }
+        if (b1 == 0xAD) { baseAscii = 'i'; diacritic = kDiaAcute; text += 2; return true; }
+        if (b1 == 0x8D) { baseAscii = 'I'; diacritic = kDiaAcute; text += 2; return true; }
+        if (b1 == 0xB3) { baseAscii = 'o'; diacritic = kDiaAcute; text += 2; return true; }
+        if (b1 == 0x93) { baseAscii = 'O'; diacritic = kDiaAcute; text += 2; return true; }
+        if (b1 == 0xBA) { baseAscii = 'u'; diacritic = kDiaAcute; text += 2; return true; }
+        if (b1 == 0x9A) { baseAscii = 'U'; diacritic = kDiaAcute; text += 2; return true; }
+        if (b1 == 0xBD) { baseAscii = 'y'; diacritic = kDiaAcute; text += 2; return true; }
+        if (b1 == 0x9D) { baseAscii = 'Y'; diacritic = kDiaAcute; text += 2; return true; }
+    }
+
+    if (b0 == 0xC4) {
+        if (b1 == 0x8D) { baseAscii = 'c'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0x87) { baseAscii = 'C'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0x8F) { baseAscii = 'd'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0x8E) { baseAscii = 'D'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0x9B) { baseAscii = 'e'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0x9A) { baseAscii = 'E'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0xA5) { baseAscii = 't'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0xA4) { baseAscii = 'T'; diacritic = kDiaCaron; text += 2; return true; }
+    }
+
+    if (b0 == 0xC5) {
+        if (b1 == 0x88) { baseAscii = 'n'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0x87) { baseAscii = 'N'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0x99) { baseAscii = 'r'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0x98) { baseAscii = 'R'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0xA1) { baseAscii = 's'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0xA0) { baseAscii = 'S'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0xA5) { baseAscii = 't'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0xA4) { baseAscii = 'T'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0xBE) { baseAscii = 'z'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0xBD) { baseAscii = 'Z'; diacritic = kDiaCaron; text += 2; return true; }
+        if (b1 == 0xAF) { baseAscii = 'u'; diacritic = kDiaRing; text += 2; return true; }
+        if (b1 == 0xAE) { baseAscii = 'U'; diacritic = kDiaRing; text += 2; return true; }
+    }
+
+    baseAscii = '?';
+    if ((b0 & 0xE0) == 0xC0 && b1 != 0) {
+        text += 2;
+    } else {
+        ++text;
+    }
+    return true;
+}
+}  // namespace
+
 Paint::Paint(unsigned char* image, int width, int height) {
     this->rotate = ROTATE_0;
     this->image = image;
@@ -179,6 +285,23 @@ void Paint::DrawStringAt(int x, int y, const char* text, sFONT* font, int colore
         /* Point on the next character */
         p_text++;
         counter++;
+    }
+}
+
+void Paint::DrawStringAtUtf8(int x, int y, const char* text, sFONT* font, int colored) {
+    const char* p_text = text;
+    int refcolumn = x;
+
+    while (*p_text != 0) {
+        char base = '?';
+        uint8_t diacritic = kDiaNone;
+        if (!decodeUtf8CzechGlyph(p_text, base, diacritic)) {
+            break;
+        }
+
+        DrawCharAt(refcolumn, y, base, font, colored);
+        drawDiacriticMark(this, refcolumn, y, font, diacritic, colored);
+        refcolumn += font->Width;
     }
 }
 

@@ -24,7 +24,14 @@ struct SettingsState {
     String selectedSsid = "";
     String wifiPassword = "";
     bool wifiConnected = false;
+    String wifiConnectedSsid = "";
     String wifiIp = "";
+    
+    // Bluetooth state
+    bool btEnabled = false;
+    bool btConnected = false;
+    String btConnectedDeviceName = "";
+    int8_t selectedBluetoothIndex = -1;
 };
 
 struct SystemState {

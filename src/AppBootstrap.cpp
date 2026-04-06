@@ -7,6 +7,30 @@
 #include "StorageManager.h"
 
 namespace {
+void logCardKbInput(char ch, Stream &out) {
+    out.print("kb input: 0x");
+    const uint8_t raw = static_cast<uint8_t>(ch);
+    if (raw < 16) {
+        out.print('0');
+    }
+    out.print(raw, HEX);
+    out.print(" '");
+
+    if (ch == '\r') {
+        out.print("\\r");
+    } else if (ch == '\n') {
+        out.print("\\n");
+    } else if (ch == 8) {
+        out.print("BACKSPACE");
+    } else if (ch >= 32 && ch <= 126) {
+        out.print(ch);
+    } else {
+        out.print('.');
+    }
+
+    out.println("'");
+}
+
 void processCardKbInput(SystemState &state, Stream &out) {
     static uint32_t lastKeyMs = 0;
     static char lastKey = 0;
@@ -24,16 +48,17 @@ void processCardKbInput(SystemState &state, Stream &out) {
 
     noteDisplayActivity();
     const bool wokeDisplays = wakeDisplaysOnInput(state, out);
+    if (wokeDisplays) {
+        // Immediately restore active UI on both displays after wake.
+        renderActiveApp(state, false, out);
+    }
+
+    logCardKbInput(ch, out);
 
     if (handleActiveAppInput(state, ch, out)) {
         lastKey = ch;
         lastKeyMs = nowMs;
         return;
-    }
-
-    if (wokeDisplays) {
-        // After wake, restore the active screen on both displays.
-        renderActiveApp(state, false, out);
     }
 
     out.print("kb key: 0x");

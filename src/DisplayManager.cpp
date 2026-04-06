@@ -2,6 +2,7 @@
 
 #include <U8g2lib.h>
 #include <WiFi.h>
+#include <BLEDevice.h>
 #include <freertos/task.h>
 
 #include "ConfigStore.h"
@@ -64,21 +65,31 @@ String gLauncherKeyMessage = "press 1 for settings";
 
 constexpr const char *kSettingsOptions[] = {
     "1) WiFi manager",
-    "2) SD enable toggle",
-    "3) SD speed cycle",
-    "4) Save config",
+    "2) Bluetooth manager",
+    "3) SD enable toggle",
+    "4) SD speed cycle",
+    "5) Save config",
 };
 
 constexpr uint8_t kSettingsOptionCount = sizeof(kSettingsOptions) / sizeof(kSettingsOptions[0]);
 constexpr uint8_t kSettingsViewHome = 0;
 constexpr uint8_t kSettingsViewWifiList = 1;
 constexpr uint8_t kSettingsViewWifiPassword = 2;
+constexpr uint8_t kSettingsViewWifiSelectList = 3;
+constexpr uint8_t kSettingsViewBluetoothList = 4;
+constexpr uint8_t kSettingsViewBluetoothSelectList = 5;
 constexpr size_t kMaxWifiNetworks = 9;
 String gWifiSsidList[kMaxWifiNetworks];
 int32_t gWifiRssiList[kMaxWifiNetworks];
 size_t gWifiCount = 0;
 // True while synchronous Wi-Fi scan is running.
 bool gWifiScanInProgress = false;
+constexpr size_t kMaxBluetoothDevices = 9;
+String gBluetoothDeviceList[kMaxBluetoothDevices];
+size_t gBluetoothDeviceCount = 0;
+bool gBluetoothScanInProgress = false;
+bool gBluetoothBleInitialized = false;
+char gCzechComposeDeadKey = 0;
 
 bool ensureEinkInitialized(SystemState &state, Stream &out);
 void markDisplayActivity();
@@ -86,6 +97,7 @@ bool tryWakeEinkPanel(SystemState &state, Stream &out);
 void forceOledSleepOff(SystemState &state);
 void forceOledWakeOn(SystemState &state);
 void drawSettingsOled(const SystemState &state);
+String transliterateCzechToAscii(const String &input);
 
 void forceOledSleepOff(SystemState &state) {
     if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -123,6 +135,7 @@ void forceOledWakeOn(SystemState &state) {
 
         // Re-init after reset hold to restore controller state deterministically.
         gOled.begin();
+        gOled.enableUTF8Print();
         gOled.setPowerSave(0);
         gOled.sendF("c", 0xAF);
         gOled.setContrast(255);
@@ -281,23 +294,46 @@ void drawSettingsOled(const SystemState &state) {
     }
 
     gOled.clearBuffer();
-    gOled.setFont(u8g2_font_6x10_tf);
+    gOled.setFont(u8g2_font_6x12_te);
     gOled.drawStr(0, 11, "SETTINGS");
 
     if (state.settings.viewMode == kSettingsViewHome) {
         // Home view: shortcut legend + compact status line.
         char speedLine[26];
         snprintf(speedLine, sizeof(speedLine), "sd hz:%lu", state.config.sdProbeSpeed);
-        gOled.drawStr(0, 22, "1 wifi 2 sd 3 speed");
-        gOled.drawStr(0, 32, "4 save 0 launcher");
-        gOled.drawStr(0, 42, state.settings.wifiEnabled ? "wifi:on" : "wifi:off");
-        gOled.drawStr(64, 42, state.config.sdEnabled ? "sd:on" : "sd:off");
-        gOled.drawStr(0, 52, speedLine);
+        String wifiLine = String("wifi:") + (state.settings.wifiEnabled ? "on" : "off");
+        if (state.settings.wifiConnected && !state.settings.wifiConnectedSsid.isEmpty()) {
+            wifiLine += " ";
+            wifiLine += state.settings.wifiConnectedSsid;
+        }
+        String btLine = String("bt:") + (state.settings.btEnabled ? "on" : "off");
+        if (state.settings.btConnected && !state.settings.btConnectedDeviceName.isEmpty()) {
+            btLine += " ";
+            btLine += state.settings.btConnectedDeviceName;
+        }
+        gOled.drawStr(0, 22, "1 wifi 2 bt 3 sd");
+        gOled.drawStr(0, 32, "4 speed 5 save");
+        gOled.setCursor(0, 42);
+        gOled.print(wifiLine);
+        gOled.setCursor(0, 52);
+        gOled.print(btLine);
+        gOled.setCursor(64, 52);
+        gOled.print(speedLine);
         gOled.setCursor(0, 62);
         gOled.print("last:");
         gOled.print(state.settings.lastMessage);
     } else if (state.settings.viewMode == kSettingsViewWifiList) {
-        // During scan we show loading text, then switch to selection hint.
+        gOled.drawStr(0, 22, "wifi manager");
+        gOled.drawStr(0, 33, "1 toggle wifi");
+        gOled.drawStr(0, 44, "2 connect wifi");
+        gOled.drawStr(0, 55, "<- back");
+        gOled.setCursor(0, 64);
+        gOled.print(state.settings.wifiEnabled ? "wifi:on" : "wifi:off");
+        if (state.settings.wifiConnected && !state.settings.wifiConnectedSsid.isEmpty()) {
+            gOled.print(" ");
+            gOled.print(state.settings.wifiConnectedSsid);
+        }
+    } else if (state.settings.viewMode == kSettingsViewWifiSelectList) {
         if (gWifiScanInProgress) {
             gOled.drawStr(0, 22, "wifi scanning...");
             gOled.drawStr(0, 33, "please wait");
@@ -305,11 +341,36 @@ void drawSettingsOled(const SystemState &state) {
         } else {
             gOled.drawStr(0, 22, "wifi list on e-ink");
             gOled.drawStr(0, 33, "type 1..9 to select");
-            gOled.drawStr(0, 44, "0 = back to settings");
+            gOled.drawStr(0, 44, "<- back to wifi");
         }
         gOled.setCursor(0, 56);
         gOled.print("found: ");
         gOled.print(gWifiCount);
+        gOled.print("  last: ");
+        gOled.print(state.settings.lastMessage);
+    } else if (state.settings.viewMode == kSettingsViewBluetoothList) {
+        if (gBluetoothScanInProgress) {
+            gOled.drawStr(0, 22, "bluetooth scanning...");
+            gOled.drawStr(0, 33, "please wait");
+        } else {
+            gOled.drawStr(0, 22, "bluetooth manager");
+            gOled.drawStr(0, 33, "1 toggle bt");
+            gOled.drawStr(0, 44, "2 scan devices");
+            gOled.drawStr(0, 55, "<- back");
+        }
+        gOled.setCursor(0, 64);
+        gOled.print(state.settings.btEnabled ? "bt:on" : "bt:off");
+        if (state.settings.btConnected && !state.settings.btConnectedDeviceName.isEmpty()) {
+            gOled.print(" ");
+            gOled.print(state.settings.btConnectedDeviceName);
+        }
+    } else if (state.settings.viewMode == kSettingsViewBluetoothSelectList) {
+        gOled.drawStr(0, 22, "bt list on e-ink");
+        gOled.drawStr(0, 33, "type 1..9 to select");
+        gOled.drawStr(0, 44, "<- back to bt");
+        gOled.setCursor(0, 56);
+        gOled.print("found: ");
+        gOled.print(gBluetoothDeviceCount);
         gOled.print("  last: ");
         gOled.print(state.settings.lastMessage);
     } else {
@@ -348,15 +409,27 @@ void drawSettingsEink(SystemState &state) {
         // Home view: current configuration + action list.
         String line0 = String("device: ") + state.config.deviceName;
         String line1 = String("wifi: ") + (state.settings.wifiEnabled ? "on" : "off");
-        String line2 = String("sd: ") + (state.config.sdEnabled ? "enabled" : "disabled");
-        String line3 = String("sd speed: ") + String(state.config.sdProbeSpeed) + " hz";
+        if (state.settings.wifiConnected && !state.settings.wifiConnectedSsid.isEmpty()) {
+            line1 += " (";
+            line1 += state.settings.wifiConnectedSsid;
+            line1 += ")";
+        }
+        String line2 = String("bt: ") + (state.settings.btEnabled ? "on" : "off");
+        if (state.settings.btConnected && !state.settings.btConnectedDeviceName.isEmpty()) {
+            line2 += " (";
+            line2 += state.settings.btConnectedDeviceName;
+            line2 += ")";
+        }
+        String line3 = String("sd: ") + (state.config.sdEnabled ? "enabled" : "disabled");
+        String line4 = String("sd speed: ") + String(state.config.sdProbeSpeed) + " hz";
 
-        paint.DrawStringAt(10, 42, line0.c_str(), &Font12, kColored);
-        paint.DrawStringAt(10, 58, line1.c_str(), &Font12, kColored);
-        paint.DrawStringAt(170, 58, line2.c_str(), &Font12, kColored);
-        paint.DrawStringAt(10, 74, line3.c_str(), &Font12, kColored);
+        paint.DrawStringAtUtf8(10, 42, line0.c_str(), &Font12, kColored);
+        paint.DrawStringAtUtf8(10, 58, line1.c_str(), &Font12, kColored);
+        paint.DrawStringAtUtf8(10, 74, line2.c_str(), &Font12, kColored);
+        paint.DrawStringAt(10, 90, line3.c_str(), &Font12, kColored);
+        paint.DrawStringAt(170, 90, line4.c_str(), &Font12, kColored);
 
-        int y = 98;
+        int y = 114;
         for (uint8_t i = 0; i < kSettingsOptionCount; ++i) {
             paint.DrawStringAt(10, y, kSettingsOptions[i], &Font12, kColored);
             y += 16;
@@ -365,7 +438,18 @@ void drawSettingsEink(SystemState &state) {
         paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
         paint.DrawStringAt(10, 218, "Input on CardKB: 1..4  (0 = launcher)", &Font12, kColored);
     } else if (state.settings.viewMode == kSettingsViewWifiList) {
-        // List view: either scanning placeholder or scan results.
+        const String wifiState = String("wifi: ") + (state.settings.wifiEnabled ? "on" : "off");
+        paint.DrawStringAt(10, 42, "WiFi manager", &Font16, kColored);
+        paint.DrawStringAt(10, 66, wifiState.c_str(), &Font12, kColored);
+        if (state.settings.wifiConnected && !state.settings.wifiConnectedSsid.isEmpty()) {
+            String ssidLine = String("connected: ") + state.settings.wifiConnectedSsid;
+            paint.DrawStringAtUtf8(10, 82, ssidLine.c_str(), &Font12, kColored);
+        }
+        paint.DrawStringAt(10, 110, "1) Toggle WiFi ON/OFF", &Font12, kColored);
+        paint.DrawStringAt(10, 126, "2) Connect to WiFi", &Font12, kColored);
+        paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
+        paint.DrawStringAt(10, 218, "Left arrow = back", &Font12, kColored);
+    } else if (state.settings.viewMode == kSettingsViewWifiSelectList) {
         paint.DrawStringAt(10, 42, "Available WiFi:", &Font12, kColored);
         if (gWifiScanInProgress) {
             paint.DrawStringAt(10, 62, "Scanning networks...", &Font12, kColored);
@@ -373,9 +457,13 @@ void drawSettingsEink(SystemState &state) {
         } else {
             int y = 58;
             for (size_t i = 0; i < gWifiCount && i < kMaxWifiNetworks; ++i) {
-                char line[64];
-                snprintf(line, sizeof(line), "%u) %s (%ld)", static_cast<unsigned>(i + 1), gWifiSsidList[i].c_str(), static_cast<long>(gWifiRssiList[i]));
-                paint.DrawStringAt(10, y, line, &Font12, kColored);
+                String line = String(static_cast<unsigned>(i + 1));
+                line += ") ";
+                line += gWifiSsidList[i];
+                line += " (";
+                line += String(static_cast<long>(gWifiRssiList[i]));
+                line += ")";
+                paint.DrawStringAtUtf8(10, y, line.c_str(), &Font12, kColored);
                 y += 16;
             }
 
@@ -385,11 +473,39 @@ void drawSettingsEink(SystemState &state) {
         }
 
         paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
-        paint.DrawStringAt(10, 218, "Type 1..9 to select, 0 back", &Font12, kColored);
+        paint.DrawStringAt(10, 218, "Type 1..9 to select, left back", &Font12, kColored);
+    } else if (state.settings.viewMode == kSettingsViewBluetoothList) {
+        const String btState = String("bluetooth: ") + (state.settings.btEnabled ? "on" : "off");
+        paint.DrawStringAt(10, 42, "Bluetooth manager", &Font16, kColored);
+        paint.DrawStringAt(10, 66, btState.c_str(), &Font12, kColored);
+        if (state.settings.btConnected && !state.settings.btConnectedDeviceName.isEmpty()) {
+            String deviceLine = String("connected: ") + state.settings.btConnectedDeviceName;
+            paint.DrawStringAtUtf8(10, 82, deviceLine.c_str(), &Font12, kColored);
+        }
+        paint.DrawStringAt(10, 110, "1) Toggle Bluetooth ON/OFF", &Font12, kColored);
+        paint.DrawStringAt(10, 126, "2) Scan devices", &Font12, kColored);
+        paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
+        paint.DrawStringAt(10, 218, "Left arrow = back", &Font12, kColored);
+    } else if (state.settings.viewMode == kSettingsViewBluetoothSelectList) {
+        paint.DrawStringAt(10, 42, "Available Bluetooth:", &Font12, kColored);
+        int y = 58;
+        for (size_t i = 0; i < gBluetoothDeviceCount && i < kMaxBluetoothDevices; ++i) {
+            String line = String(static_cast<unsigned>(i + 1));
+            line += ") ";
+            line += gBluetoothDeviceList[i];
+            paint.DrawStringAtUtf8(10, y, line.c_str(), &Font12, kColored);
+            y += 16;
+        }
+        if (gBluetoothDeviceCount == 0) {
+            paint.DrawStringAt(10, 76, "No devices found", &Font12, kColored);
+        }
+        paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
+        paint.DrawStringAt(10, 218, "Type 1..9 to select, left back", &Font12, kColored);
     } else {
         // Password view: e-ink only shows context, typing remains on OLED.
+        const String selectedSsidUtf8 = state.settings.selectedSsid;
         paint.DrawStringAt(10, 42, "Connect to:", &Font12, kColored);
-        paint.DrawStringAt(98, 42, state.settings.selectedSsid.c_str(), &Font12, kColored);
+        paint.DrawStringAtUtf8(98, 42, selectedSsidUtf8.c_str(), &Font12, kColored);
         paint.DrawStringAt(10, 60, "Password on OLED keyboard", &Font12, kColored);
         paint.DrawStringAt(10, 78, "Press ENTER to connect", &Font12, kColored);
         paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
@@ -429,6 +545,31 @@ size_t scanWifiNetworks(Stream &out) {
     return gWifiCount;
 }
 
+bool toggleWifiEnabled(SystemState &state, Stream &out) {
+    if (state.settings.wifiEnabled) {
+        WiFi.disconnect(true, false);
+        WiFi.mode(WIFI_OFF);
+        state.settings.wifiEnabled = false;
+        state.settings.wifiConnected = false;
+        state.settings.wifiConnectedSsid = "";
+        state.settings.wifiIp = "";
+        state.settings.lastMessage = "wifi disabled";
+        out.println("WiFi: disabled");
+        return true;
+    }
+
+    WiFi.mode(WIFI_STA);
+    state.settings.wifiEnabled = true;
+    state.settings.wifiConnected = (WiFi.status() == WL_CONNECTED);
+    if (state.settings.wifiConnected) {
+        state.settings.wifiConnectedSsid = WiFi.SSID();
+        state.settings.wifiIp = WiFi.localIP().toString();
+    }
+    state.settings.lastMessage = "wifi enabled";
+    out.println("WiFi: enabled");
+    return true;
+}
+
 bool connectSelectedWifi(SystemState &state, Stream &out) {
     if (state.settings.selectedSsid.isEmpty()) {
         state.settings.lastMessage = "no ssid";
@@ -447,6 +588,7 @@ bool connectSelectedWifi(SystemState &state, Stream &out) {
     if (WiFi.status() == WL_CONNECTED) {
         state.settings.wifiEnabled = true;
         state.settings.wifiConnected = true;
+        state.settings.wifiConnectedSsid = state.settings.selectedSsid;
         state.settings.wifiIp = WiFi.localIP().toString();
         state.settings.lastMessage = String("connected ") + state.settings.wifiIp;
         out.print("WiFi connected: ");
@@ -459,6 +601,77 @@ bool connectSelectedWifi(SystemState &state, Stream &out) {
     state.settings.lastMessage = "wifi connect fail";
     out.println("WiFi connect failed");
     return false;
+}
+
+bool toggleBluetoothEnabled(SystemState &state, Stream &out) {
+    if (state.settings.btEnabled) {
+        state.settings.btEnabled = false;
+        state.settings.btConnected = false;
+        state.settings.btConnectedDeviceName = "";
+        state.settings.selectedBluetoothIndex = -1;
+        state.settings.lastMessage = "bt disabled";
+        out.println("Bluetooth: disabled");
+        return true;
+    }
+
+    state.settings.btEnabled = true;
+    state.settings.lastMessage = "bt enabled";
+    out.println("Bluetooth: enabled");
+    return true;
+}
+
+size_t scanBluetoothDevices(Stream &out) {
+    gBluetoothDeviceCount = 0;
+    out.println("Bluetooth: scanning (BLE)");
+
+    if (!gBluetoothBleInitialized) {
+        BLEDevice::init("mp3-pedia-os");
+        gBluetoothBleInitialized = true;
+    }
+
+    BLEScan *scan = BLEDevice::getScan();
+    if (scan == nullptr) {
+        out.println("Bluetooth: scan init failed");
+        return 0;
+    }
+
+    scan->setActiveScan(true);
+    scan->setInterval(100);
+    scan->setWindow(80);
+
+    BLEScanResults results = scan->start(4, false);
+    const int found = results.getCount();
+
+    for (int i = 0; i < found && gBluetoothDeviceCount < kMaxBluetoothDevices; ++i) {
+        BLEAdvertisedDevice device = results.getDevice(i);
+        String label = "";
+
+        std::string name = device.getName();
+        if (!name.empty()) {
+            label = String(name.c_str());
+        } else {
+            std::string addr = device.getAddress().toString();
+            label = String("BLE ") + String(addr.c_str());
+        }
+
+        // Avoid duplicates in the short on-screen list.
+        bool duplicate = false;
+        for (size_t j = 0; j < gBluetoothDeviceCount; ++j) {
+            if (gBluetoothDeviceList[j] == label) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            gBluetoothDeviceList[gBluetoothDeviceCount++] = label;
+        }
+    }
+
+    scan->clearResults();
+
+    out.print("Bluetooth: found ");
+    out.println(gBluetoothDeviceCount);
+    return gBluetoothDeviceCount;
 }
 
 void cycleSdSpeed(AppConfig &config) {
@@ -491,6 +704,143 @@ char normalizeInputKey(char key) {
     return key;
 }
 
+String transliterateCzechToAscii(const String &input) {
+    String out;
+    out.reserve(input.length());
+
+    for (size_t i = 0; i < input.length(); ++i) {
+        const uint8_t b0 = static_cast<uint8_t>(input[i]);
+        if (b0 == 0xC3 && (i + 1) < input.length()) {
+            const uint8_t b1 = static_cast<uint8_t>(input[i + 1]);
+            if (b1 == 0xA1) { out += 'a'; ++i; continue; }
+            if (b1 == 0xA9) { out += 'e'; ++i; continue; }
+            if (b1 == 0xAD) { out += 'i'; ++i; continue; }
+            if (b1 == 0xB3) { out += 'o'; ++i; continue; }
+            if (b1 == 0xBA) { out += 'u'; ++i; continue; }
+            if (b1 == 0xBD) { out += 'y'; ++i; continue; }
+            if (b1 == 0x81) { out += 'A'; ++i; continue; }
+            if (b1 == 0x89) { out += 'E'; ++i; continue; }
+            if (b1 == 0x8D) { out += 'I'; ++i; continue; }
+            if (b1 == 0x93) { out += 'O'; ++i; continue; }
+            if (b1 == 0x9A) { out += 'U'; ++i; continue; }
+            if (b1 == 0x9D) { out += 'Y'; ++i; continue; }
+        }
+
+        if (b0 == 0xC4 && (i + 1) < input.length()) {
+            const uint8_t b1 = static_cast<uint8_t>(input[i + 1]);
+            if (b1 == 0x8D) { out += 'c'; ++i; continue; }
+            if (b1 == 0x87) { out += 'C'; ++i; continue; }
+            if (b1 == 0x8F) { out += 'd'; ++i; continue; }
+            if (b1 == 0x8E) { out += 'D'; ++i; continue; }
+            if (b1 == 0x9B) { out += 'e'; ++i; continue; }
+            if (b1 == 0x9A) { out += 'E'; ++i; continue; }
+            if (b1 == 0xA5) { out += 't'; ++i; continue; }
+            if (b1 == 0xA4) { out += 'T'; ++i; continue; }
+        }
+
+        if (b0 == 0xC5 && (i + 1) < input.length()) {
+            const uint8_t b1 = static_cast<uint8_t>(input[i + 1]);
+            if (b1 == 0x88) { out += 'n'; ++i; continue; }
+            if (b1 == 0x87) { out += 'N'; ++i; continue; }
+            if (b1 == 0x99) { out += 'r'; ++i; continue; }
+            if (b1 == 0x98) { out += 'R'; ++i; continue; }
+            if (b1 == 0xA1) { out += 's'; ++i; continue; }
+            if (b1 == 0xA0) { out += 'S'; ++i; continue; }
+            if (b1 == 0xAF) { out += 'u'; ++i; continue; }
+            if (b1 == 0xAE) { out += 'U'; ++i; continue; }
+            if (b1 == 0xBE) { out += 'z'; ++i; continue; }
+            if (b1 == 0xBD) { out += 'Z'; ++i; continue; }
+        }
+
+        out += static_cast<char>(b0);
+    }
+    return out;
+}
+
+String mapCzechComposedChar(char deadKey, char base) {
+    if (deadKey == '^') {
+        if (base == 'c') return "č";
+        if (base == 'C') return "Č";
+        if (base == 'd') return "ď";
+        if (base == 'D') return "Ď";
+        if (base == 'e') return "ě";
+        if (base == 'E') return "Ě";
+        if (base == 'n') return "ň";
+        if (base == 'N') return "Ň";
+        if (base == 'r') return "ř";
+        if (base == 'R') return "Ř";
+        if (base == 's') return "š";
+        if (base == 'S') return "Š";
+        if (base == 't') return "ť";
+        if (base == 'T') return "Ť";
+        if (base == 'z') return "ž";
+        if (base == 'Z') return "Ž";
+    }
+
+    if (deadKey == '\'') {
+        if (base == 'a') return "á";
+        if (base == 'A') return "Á";
+        if (base == 'e') return "é";
+        if (base == 'E') return "É";
+        if (base == 'i') return "í";
+        if (base == 'I') return "Í";
+        if (base == 'o') return "ó";
+        if (base == 'O') return "Ó";
+        if (base == 'u') return "ú";
+        if (base == 'U') return "Ú";
+        if (base == 'y') return "ý";
+        if (base == 'Y') return "Ý";
+    }
+
+    if (deadKey == '"') {
+        if (base == 'u') return "ů";
+        if (base == 'U') return "Ů";
+    }
+
+    String fallback = "";
+    fallback += deadKey;
+    fallback += base;
+    return fallback;
+}
+
+bool decodeCzechComposeKey(char key, String &outputChunk) {
+    if (key == '^' || key == '\'' || key == '"') {
+        gCzechComposeDeadKey = key;
+        outputChunk = "";
+        return true;
+    }
+
+    if (gCzechComposeDeadKey != 0) {
+        outputChunk = mapCzechComposedChar(gCzechComposeDeadKey, key);
+        gCzechComposeDeadKey = 0;
+        return true;
+    }
+
+    outputChunk = String(key);
+    return true;
+}
+
+bool tryApplyPostfixCzechCompose(String &buffer, char deadKey) {
+    if (buffer.isEmpty()) {
+        return false;
+    }
+
+    const char base = buffer[buffer.length() - 1];
+    const String mapped = mapCzechComposedChar(deadKey, base);
+    if (mapped.length() == 2 && mapped[0] == deadKey && mapped[1] == base) {
+        return false;
+    }
+
+    buffer.remove(buffer.length() - 1);
+    buffer += mapped;
+    return true;
+}
+
+bool isCardKbLeftArrowCode(uint8_t code) {
+    // CardKB left-arrow observed variants.
+    return code == 0x94 || code == 0xB4;
+}
+
 char decodeCardKbKey(char rawKey) {
     // Some keys arrive with high-bit set; strip it for printable/control keys.
     const char normalized = normalizeInputKey(rawKey);
@@ -509,30 +859,32 @@ char decodeCardKbKey(char rawKey) {
 bool applySettingsSelection(SystemState &state, uint8_t optionIndex, Stream &out) {
     state.settings.lastSelection = optionIndex;
     if (optionIndex == 0) {
-        // Wi-Fi manager entry: render loading immediately, then scan.
+        // Wi-Fi manager entry with explicit actions.
         state.settings.viewMode = kSettingsViewWifiList;
-        state.settings.lastMessage = "wifi scanning";
+        state.settings.lastMessage = "wifi manager";
         state.settings.selectedWifiIndex = -1;
         state.settings.selectedSsid = "";
         state.settings.wifiPassword = "";
         gWifiCount = 0;
-        gWifiScanInProgress = true;
-        renderSettingsScreen(state, false, out);
-        scanWifiNetworks(out);
-        gWifiScanInProgress = false;
-        state.settings.lastMessage = "select wifi";
         out.println("Settings: wifi manager open");
         return true;
     }
 
     if (optionIndex == 1) {
+        state.settings.viewMode = kSettingsViewBluetoothList;
+        state.settings.lastMessage = "bluetooth manager";
+        out.println("Settings: bluetooth manager open");
+        return true;
+    }
+
+    if (optionIndex == 2) {
         state.config.sdEnabled = !state.config.sdEnabled;
         state.settings.lastMessage = state.config.sdEnabled ? "sd enabled" : "sd disabled";
         out.println("Settings: sd enabled toggled");
         return true;
     }
 
-    if (optionIndex == 2) {
+    if (optionIndex == 3) {
         cycleSdSpeed(state.config);
         state.settings.lastMessage = String("sd ") + state.config.sdProbeSpeed;
         out.print("Settings: sd speed set to ");
@@ -540,7 +892,7 @@ bool applySettingsSelection(SystemState &state, uint8_t optionIndex, Stream &out
         return true;
     }
 
-    if (optionIndex == 3) {
+    if (optionIndex == 4) {
         const bool ok = saveConfig(state.config);
         state.settings.lastMessage = ok ? "config saved" : "save failed";
         out.println(ok ? "Settings: config saved" : "Settings: config save failed");
@@ -632,6 +984,7 @@ bool initDisplays(SystemState &state, Stream &out) {
     out.println("--- Display init ---");
 
     gOled.begin();
+    gOled.enableUTF8Print();
     gOledHeldInReset = false;
     state.oledReady = true;
     drawBootScreen(state.config.deviceName);
@@ -802,6 +1155,51 @@ bool renderActiveApp(SystemState &state, bool oledOnly, Stream &out) {
 
 bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
     // Decode CardKB-specific encodings before app-level routing.
+    const uint8_t rawCode = static_cast<uint8_t>(key);
+    if (isCardKbLeftArrowCode(rawCode)) {
+        if (state.launcher.activeAppId.equalsIgnoreCase("settings")) {
+            if (state.settings.viewMode == kSettingsViewWifiPassword) {
+                state.settings.viewMode = kSettingsViewWifiSelectList;
+                state.settings.wifiPassword = "";
+                state.settings.lastMessage = "password canceled";
+                renderSettingsScreen(state, false, out);
+                return true;
+            }
+
+            if (state.settings.viewMode == kSettingsViewWifiSelectList) {
+                state.settings.viewMode = kSettingsViewWifiList;
+                state.settings.lastMessage = "wifi list closed";
+                renderSettingsScreen(state, false, out);
+                return true;
+            }
+
+            if (state.settings.viewMode == kSettingsViewBluetoothSelectList) {
+                state.settings.viewMode = kSettingsViewBluetoothList;
+                state.settings.lastMessage = "device list closed";
+                renderSettingsScreen(state, false, out);
+                return true;
+            }
+
+            if (state.settings.viewMode == kSettingsViewBluetoothList || state.settings.viewMode == kSettingsViewWifiList) {
+                state.settings.viewMode = kSettingsViewHome;
+                state.settings.lastMessage = "back";
+                renderSettingsScreen(state, false, out);
+                return true;
+            }
+
+            state.launcher.activeAppId = "launcher";
+            state.settings.lastMessage = "back to launcher";
+            renderLauncherScreen(state, false, out);
+            return true;
+        }
+
+        if (!state.launcher.activeAppId.equalsIgnoreCase("launcher")) {
+            state.launcher.activeAppId = "launcher";
+            renderLauncherScreen(state, false, out);
+            return true;
+        }
+    }
+
     const char normalizedKey = decodeCardKbKey(key);
 
     if (state.launcher.activeAppId.equalsIgnoreCase("launcher")) {
@@ -827,15 +1225,38 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
 
     if (state.launcher.activeAppId.equalsIgnoreCase("settings")) {
         if (state.settings.viewMode == kSettingsViewWifiList) {
-            if (normalizedKey == '0') {
-                state.settings.viewMode = kSettingsViewHome;
-                state.settings.lastMessage = "wifi list closed";
+            if (normalizedKey == '1') {
+                toggleWifiEnabled(state, out);
                 renderSettingsScreen(state, false, out);
                 return true;
             }
 
+            if (normalizedKey == '2') {
+                if (!state.settings.wifiEnabled) {
+                    state.settings.lastMessage = "enable wifi first";
+                    renderSettingsScreen(state, false, out);
+                    return true;
+                }
+
+                state.settings.viewMode = kSettingsViewWifiSelectList;
+                state.settings.selectedWifiIndex = -1;
+                state.settings.selectedSsid = "";
+                state.settings.wifiPassword = "";
+                state.settings.lastMessage = "wifi scanning";
+                gWifiCount = 0;
+                gWifiScanInProgress = true;
+                renderSettingsScreen(state, false, out);
+                scanWifiNetworks(out);
+                gWifiScanInProgress = false;
+                state.settings.lastMessage = "select wifi";
+                renderSettingsScreen(state, false, out);
+                return true;
+            }
+            return false;
+        }
+
+        if (state.settings.viewMode == kSettingsViewWifiSelectList) {
             if (normalizedKey >= '1' && normalizedKey <= '9') {
-                // Number keys pick an SSID directly by list index.
                 const uint8_t pick = static_cast<uint8_t>(normalizedKey - '1');
                 if (pick < gWifiCount) {
                     state.settings.selectedWifiIndex = static_cast<int8_t>(pick);
@@ -850,10 +1271,59 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             return false;
         }
 
+        if (state.settings.viewMode == kSettingsViewBluetoothList) {
+            if (normalizedKey == '1') {
+                toggleBluetoothEnabled(state, out);
+                renderSettingsScreen(state, false, out);
+                return true;
+            }
+
+            if (normalizedKey == '2') {
+                if (!state.settings.btEnabled) {
+                    state.settings.lastMessage = "enable bt first";
+                    renderSettingsScreen(state, false, out);
+                    return true;
+                }
+
+                state.settings.viewMode = kSettingsViewBluetoothSelectList;
+                state.settings.selectedBluetoothIndex = -1;
+                state.settings.btConnectedDeviceName = "";
+                state.settings.btConnected = false;
+                state.settings.lastMessage = "bt scanning";
+                gBluetoothDeviceCount = 0;
+                gBluetoothScanInProgress = true;
+                renderSettingsScreen(state, false, out);
+                scanBluetoothDevices(out);
+                gBluetoothScanInProgress = false;
+                state.settings.lastMessage = "select bt";
+                renderSettingsScreen(state, false, out);
+                return true;
+            }
+
+            return false;
+        }
+
+        if (state.settings.viewMode == kSettingsViewBluetoothSelectList) {
+            if (normalizedKey >= '1' && normalizedKey <= '9') {
+                const uint8_t pick = static_cast<uint8_t>(normalizedKey - '1');
+                if (pick < gBluetoothDeviceCount) {
+                    state.settings.selectedBluetoothIndex = static_cast<int8_t>(pick);
+                    state.settings.btConnectedDeviceName = gBluetoothDeviceList[pick];
+                    state.settings.btConnected = true;
+                    state.settings.lastMessage = String("bt connected ") + state.settings.btConnectedDeviceName;
+                    state.settings.viewMode = kSettingsViewBluetoothList;
+                    renderSettingsScreen(state, false, out);
+                    return true;
+                }
+            }
+            return false;
+        }
+
         if (state.settings.viewMode == kSettingsViewWifiPassword) {
             // Password mode intentionally updates only OLED on typing keys.
             if (normalizedKey == '0') {
-                state.settings.viewMode = kSettingsViewWifiList;
+                gCzechComposeDeadKey = 0;
+                state.settings.viewMode = kSettingsViewWifiSelectList;
                 state.settings.wifiPassword = "";
                 state.settings.lastMessage = "password canceled";
                 renderSettingsScreen(state, false, out);
@@ -861,6 +1331,7 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             }
 
             if (normalizedKey == '\n' || normalizedKey == '\r') {
+                gCzechComposeDeadKey = 0;
                 // Enter commits connect action and returns to settings home.
                 state.settings.lastMessage = "connecting...";
                 renderSettingsScreen(state, true, out);
@@ -871,6 +1342,7 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             }
 
             if (normalizedKey == 8 || normalizedKey == 127) {
+                gCzechComposeDeadKey = 0;
                 if (!state.settings.wifiPassword.isEmpty()) {
                     state.settings.wifiPassword.remove(state.settings.wifiPassword.length() - 1);
                 }
@@ -880,10 +1352,32 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             }
 
             if (normalizedKey >= 32 && normalizedKey <= 126) {
-                if (state.settings.wifiPassword.length() < 63) {
-                    state.settings.wifiPassword += normalizedKey;
+                char composeKey = normalizedKey;
+                if (composeKey == '/') {
+                    composeKey = '^';
                 }
-                state.settings.lastMessage = String("key: ") + normalizedKey;
+
+                if (composeKey == '^' || composeKey == '\'' || composeKey == '"') {
+                    if (tryApplyPostfixCzechCompose(state.settings.wifiPassword, composeKey)) {
+                        state.settings.lastMessage = "compose postfix";
+                        renderSettingsScreen(state, true, out);
+                        return true;
+                    }
+                }
+
+                String typed;
+                decodeCzechComposeKey(composeKey, typed);
+
+                if (typed.isEmpty()) {
+                    state.settings.lastMessage = "compose...";
+                    renderSettingsScreen(state, true, out);
+                    return true;
+                }
+
+                if (state.settings.wifiPassword.length() + typed.length() < 63) {
+                    state.settings.wifiPassword += typed;
+                }
+                state.settings.lastMessage = String("key: ") + typed;
                 renderSettingsScreen(state, true, out);
                 return true;
             }
@@ -896,7 +1390,7 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             return true;
         }
 
-        if (normalizedKey >= '1' && normalizedKey <= '4') {
+        if (normalizedKey >= '1' && normalizedKey <= '5') {
             const uint8_t optionIndex = static_cast<uint8_t>(normalizedKey - '1');
             if (applySettingsSelection(state, optionIndex, out)) {
                 renderSettingsScreen(state, false, out);
