@@ -23,12 +23,19 @@ void processCardKbInput(SystemState &state, Stream &out) {
     }
 
     noteDisplayActivity();
-    wakeDisplaysOnInput(state, out);
+    const bool wokeDisplays = wakeDisplaysOnInput(state, out);
 
     if (handleActiveAppInput(state, ch, out)) {
+        // Keep both displays in sync when the active app handled the key.
+        renderActiveApp(state, out);
         lastKey = ch;
         lastKeyMs = nowMs;
         return;
+    }
+
+    if (wokeDisplays) {
+        // After wake, restore the active screen on both displays.
+        renderActiveApp(state, out);
     }
 
     out.print("kb key: 0x");
@@ -57,6 +64,10 @@ void setupApplication(SystemState &state, TaskManager &taskManager) {
 
     Serial.println("os project ready");
     printPrompt();
+
+    // Core safety: create mutexes before any hardware access or task starts.
+    state.i2cMutex = xSemaphoreCreateMutex();
+    state.spiMutex = xSemaphoreCreateMutex();
 
     state.i2cReady = initHardware(state);
     initDisplays(state);
@@ -122,10 +133,6 @@ void processApplicationLoop(SystemState &state, TaskManager &taskManager) {
     }
 
     processCardKbInput(state, Serial);
-
-    if (Serial.available() > 0) {
-        noteDisplayActivity();
-    }
 
     processSerialInput(state, taskManager, Serial);
     handleEinkIdleTimeout(state, Serial);

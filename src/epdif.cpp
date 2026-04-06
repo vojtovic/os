@@ -27,6 +27,7 @@
 
 #include "epdif.h"
 #include <SPI.h>
+#include <freertos/task.h>
 
 EpdIf::EpdIf() {};
 EpdIf::~EpdIf() {};
@@ -40,13 +41,15 @@ int EpdIf::DigitalRead(int pin) {
 }
 
 void EpdIf::DelayMs(unsigned int delaytime) {
-    delay(delaytime);
+    vTaskDelay(pdMS_TO_TICKS(delaytime));
 }
 
 void EpdIf::SpiTransfer(unsigned char data) {
+    SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
     digitalWrite(CS_PIN, LOW);
     SPI.transfer(data);
     digitalWrite(CS_PIN, HIGH);
+    SPI.endTransaction();
 }
 
 int EpdIf::IfInit(void) {
@@ -56,8 +59,7 @@ int EpdIf::IfInit(void) {
     pinMode(BUSY_PIN, INPUT);
     // PWR_PIN nemáme zapojený, přeskočíme
 
-    SPI.begin(12, -1, 11, 16);  // SCK, MISO, MOSI, SS
-    SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+    SPI.begin();
     return 0;
 }
 

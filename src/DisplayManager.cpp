@@ -2,6 +2,7 @@
 
 #include <U8g2lib.h>
 #include <WiFi.h>
+#include <freertos/task.h>
 
 #include "ConfigStore.h"
 #include "EPD_3in52.h"
@@ -39,10 +40,8 @@ constexpr int kEinkLandscapeWidth = EPD_HEIGHT;
 constexpr int kEinkLandscapeHeight = EPD_WIDTH;
 constexpr uint32_t kEinkIdleTimeoutMs = 60000;
 
-U8G2_SH1106_128X64_NONAME_F_4W_SW_SPI gOled(
+U8G2_SH1106_128X64_NONAME_F_4W_HW_SPI gOled(
     U8G2_R0,
-    kOledClk,
-    kOledMosi,
     kOledCs,
     kOledDc,
     kOledRes);
@@ -60,6 +59,7 @@ size_t gSdAppCount = 0;
 uint32_t gLastDisplayActivityMs = 0;
 bool gEinkSleeping = false;
 bool gOledSleeping = false;
+bool gOledHeldInReset = false;
 String gLauncherKeyMessage = "press 1 for settings";
 
 constexpr const char *kSettingsOptions[] = {
@@ -81,6 +81,87 @@ size_t gWifiCount = 0;
 bool gWifiScanInProgress = false;
 
 bool ensureEinkInitialized(SystemState &state, Stream &out);
+void markDisplayActivity();
+bool tryWakeEinkPanel(SystemState &state, Stream &out);
+void forceOledSleepOff(SystemState &state);
+void forceOledWakeOn(SystemState &state);
+void drawSettingsOled(const SystemState &state);
+
+void forceOledSleepOff(SystemState &state) {
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // Try graceful blank first.
+        gOled.clearBuffer();
+        gOled.sendBuffer();
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        // Explicit SH1106 off sequence; some modules ignore generic power-save.
+        gOled.sendF("c", 0xAE);
+        gOled.sendF("c", 0xA4);
+        gOled.setContrast(0);
+        gOled.setPowerSave(1);
+
+        // Hold controller in reset so pixels are guaranteed off.
+        pinMode(kOledRes, OUTPUT);
+        digitalWrite(kOledRes, LOW);
+        gOledHeldInReset = true;
+        xSemaphoreGive(state.spiMutex);
+    }
+}
+
+void forceOledWakeOn(SystemState &state) {
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // Always issue a clean reset pulse before re-init.
+        pinMode(kOledRes, OUTPUT);
+        digitalWrite(kOledRes, LOW);
+        vTaskDelay(pdMS_TO_TICKS(2));
+        digitalWrite(kOledRes, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(5));
+
+        if (gOledHeldInReset) {
+            gOledHeldInReset = false;
+        }
+
+        // Re-init after reset hold to restore controller state deterministically.
+        gOled.begin();
+        gOled.setPowerSave(0);
+        gOled.sendF("c", 0xAF);
+        gOled.setContrast(255);
+
+        // Push a known blank frame before the next app redraw.
+        gOled.clearBuffer();
+        gOled.sendBuffer();
+        xSemaphoreGive(state.spiMutex);
+    }
+}
+
+bool tryWakeEinkPanel(SystemState &state, Stream &out) {
+    gEink.Reset();
+    vTaskDelay(pdMS_TO_TICKS(20));
+    if (gEink.Init() == 0) {
+        gEinkSleeping = false;
+        gEinkPartialRefreshCounter = 0;
+        markDisplayActivity();
+        out.println("E-ink: awake");
+        return true;
+    }
+
+    out.println("E-ink: retry wake...");
+    gEink.Reset();
+    vTaskDelay(pdMS_TO_TICKS(120));
+    if (gEink.Init() == 0) {
+        gEinkSleeping = false;
+        gEinkPartialRefreshCounter = 0;
+        markDisplayActivity();
+        out.println("E-ink: awake after retry");
+        return true;
+    }
+
+    state.einkReady = false;
+    gEinkSleeping = false;
+    gEinkInitAttempted = false;
+    out.println("E-ink: wake failed");
+    return false;
+}
 
 void markDisplayActivity() {
     // Shared activity marker for idle timeout logic.
@@ -163,6 +244,31 @@ void drawLauncherPreview(const SystemState &state, Stream &out) {
         out.print(". ");
         out.println(gSdApps[i]);
     }
+}
+
+void drawActiveAppOled(const SystemState &state) {
+    if (!state.oledReady) {
+        return;
+    }
+
+    if (state.launcher.activeAppId.equalsIgnoreCase("launcher")) {
+        drawLauncherOled(state);
+        return;
+    }
+
+    if (state.launcher.activeAppId.equalsIgnoreCase("settings")) {
+        drawSettingsOled(state);
+        return;
+    }
+
+    String title = String("app: ") + state.launcher.activeAppId;
+    gOled.clearBuffer();
+    gOled.setFont(u8g2_font_6x10_tf);
+    gOled.drawStr(0, 14, "not implemented yet");
+    gOled.drawStr(0, 30, title.c_str());
+    gOled.drawStr(0, 46, "open settings first");
+    gOled.drawStr(0, 62, "launcher show");
+    gOled.sendBuffer();
 }
 
 void prepareLandscapePaint(Paint &paint) {
@@ -291,8 +397,11 @@ void drawSettingsEink(SystemState &state) {
     }
 
     gEink.display(paint.GetImage());
+    vTaskDelay(pdMS_TO_TICKS(1));
     gEink.lut_GC();
+    vTaskDelay(pdMS_TO_TICKS(1));
     gEink.refresh();
+    vTaskDelay(pdMS_TO_TICKS(5));
 }
 
 
@@ -465,8 +574,11 @@ bool renderPlaceholderApp(SystemState &state, Stream &out) {
         paint.DrawStringAt(10, 72, "This app is not implemented yet", &Font12, kColored);
         paint.DrawStringAt(10, 92, "Try: launcher open settings", &Font12, kColored);
         gEink.display(paint.GetImage());
+        vTaskDelay(pdMS_TO_TICKS(1));
         gEink.lut_GC();
+        vTaskDelay(pdMS_TO_TICKS(1));
         gEink.refresh();
+        vTaskDelay(pdMS_TO_TICKS(5));
         gEinkPartialRefreshCounter = 0;
         ++gEinkUpdateCounter;
     }
@@ -483,16 +595,9 @@ bool ensureEinkInitialized(SystemState &state, Stream &out) {
     if (state.einkReady && gEinkSleeping) {
         // Wake path after idle sleep.
         out.println("E-ink: wake from sleep...");
-        if (gEink.Init() == 0) {
-            gEinkSleeping = false;
-            gEinkPartialRefreshCounter = 0;
-            markDisplayActivity();
-            out.println("E-ink: awake");
+        if (tryWakeEinkPanel(state, out)) {
             return true;
         }
-
-        state.einkReady = false;
-        out.println("E-ink: wake failed");
         return false;
     }
 
@@ -519,10 +624,15 @@ bool ensureEinkInitialized(SystemState &state, Stream &out) {
 }
 }  // namespace
 
+void renderActiveAppOled(const SystemState &state) {
+    drawActiveAppOled(state);
+}
+
 bool initDisplays(SystemState &state, Stream &out) {
     out.println("--- Display init ---");
 
     gOled.begin();
+    gOledHeldInReset = false;
     state.oledReady = true;
     drawBootScreen(state.config.deviceName);
     out.println("OLED: ready");
@@ -582,56 +692,66 @@ void printLauncherInfo(const SystemState &state, Stream &out) {
 }
 
 bool renderLauncherScreen(SystemState &state, Stream &out) {
-    drawLauncherOled(state);
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        drawLauncherOled(state);
+        xSemaphoreGive(state.spiMutex);
+    }
 
     if (!ensureEinkInitialized(state, out)) {
         out.println("OLED: launcher rendered");
         return state.oledReady;
     }
 
-    Paint paint(gEinkBuffer, kEinkNativeWidth, kEinkNativeHeight);
-    prepareLandscapePaint(paint);
-    paint.Clear(kUncolored);
-    paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
-    paint.DrawStringAt(8, 8, "APP LAUNCHER", &Font16, kColored);
-    paint.DrawStringAt(8, 26, state.config.deviceName.c_str(), &Font12, kColored);
-    paint.DrawStringAt(172, 26, state.launcher.activeAppId.c_str(), &Font12, kColored);
-    paint.DrawLine(0, 38, kEinkLandscapeWidth - 1, 38, kColored);
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        Paint paint(gEinkBuffer, kEinkNativeWidth, kEinkNativeHeight);
+        prepareLandscapePaint(paint);
+        paint.Clear(kUncolored);
+        paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
+        paint.DrawStringAt(8, 8, "APP LAUNCHER", &Font16, kColored);
+        paint.DrawStringAt(8, 26, state.config.deviceName.c_str(), &Font12, kColored);
+        paint.DrawStringAt(172, 26, state.launcher.activeAppId.c_str(), &Font12, kColored);
+        paint.DrawLine(0, 38, kEinkLandscapeWidth - 1, 38, kColored);
 
-    const int cardWidth = 110;
-    const int cardHeight = 82;
-    const int startX = 8;
-    const int startY = 46;
-    const int xGap = 8;
-    const int yGap = 12;
+        const int cardWidth = 110;
+        const int cardHeight = 82;
+        const int startX = 8;
+        const int startY = 46;
+        const int xGap = 8;
+        const int yGap = 12;
 
-    for (size_t index = 0; index < kLauncherAppCount; ++index) {
-        const int column = static_cast<int>(index % 3);
-        const int row = static_cast<int>(index / 3);
-        const int x = startX + column * (cardWidth + xGap);
-        const int y = startY + row * (cardHeight + yGap);
-        const bool selected = index == state.launcher.selectedIndex;
-        drawLauncherCard(paint, x, y, cardWidth, cardHeight, kLauncherApps[index], selected);
-    }
-
-    paint.DrawStringAt(8, 208, "open settings: press 1 on CardKB", &Font12, kColored);
-    gSdAppCount = loadSdAppManifest(state, gSdApps, kMaxSdApps, out);
-    if (gSdAppCount > 0) {
-        paint.DrawStringAt(8, 224, "sd apps:", &Font12, kColored);
-        int x = 76;
-        for (size_t i = 0; i < gSdAppCount && i < 4; ++i) {
-            paint.DrawStringAt(x, 224, gSdApps[i].c_str(), &Font8, kColored);
-            x += 70;
+        for (size_t index = 0; index < kLauncherAppCount; ++index) {
+            const int column = static_cast<int>(index % 3);
+            const int row = static_cast<int>(index / 3);
+            const int x = startX + column * (cardWidth + xGap);
+            const int y = startY + row * (cardHeight + yGap);
+            const bool selected = index == state.launcher.selectedIndex;
+            drawLauncherCard(paint, x, y, cardWidth, cardHeight, kLauncherApps[index], selected);
         }
+
+        paint.DrawStringAt(8, 208, "open settings: press 1 on CardKB", &Font12, kColored);
+        gSdAppCount = loadSdAppManifest(state, gSdApps, kMaxSdApps, out);
+        if (gSdAppCount > 0) {
+            paint.DrawStringAt(8, 224, "sd apps:", &Font12, kColored);
+            int x = 76;
+            for (size_t i = 0; i < gSdAppCount && i < 4; ++i) {
+                paint.DrawStringAt(x, 224, gSdApps[i].c_str(), &Font8, kColored);
+                x += 70;
+            }
+        }
+
+        // Launcher always uses full refresh for readability/stability.
+        gEink.display(paint.GetImage());
+        vTaskDelay(pdMS_TO_TICKS(1));
+        gEink.lut_GC();
+        vTaskDelay(pdMS_TO_TICKS(1));
+        gEink.refresh();
+        vTaskDelay(pdMS_TO_TICKS(5));
+        gEinkPartialRefreshCounter = 0;
+
+        ++gEinkUpdateCounter;
+        xSemaphoreGive(state.spiMutex);
     }
 
-    // Launcher always uses full refresh for readability/stability.
-    gEink.display(paint.GetImage());
-    gEink.lut_GC();
-    gEink.refresh();
-    gEinkPartialRefreshCounter = 0;
-
-    ++gEinkUpdateCounter;
     markDisplayActivity();
     out.println("E-ink: launcher rendered");
     return true;
@@ -816,7 +936,6 @@ bool renderEinkMessage(SystemState &state, const String &rawText, bool forceFull
 
     gEink.display(paint.GetImage());
     if (doFull) {
-        gEink.lut_GC();
         gEinkPartialRefreshCounter = 0;
     } else {
         gEink.lut_DU();
@@ -832,36 +951,23 @@ bool renderEinkMessage(SystemState &state, const String &rawText, bool forceFull
 
 bool wakeDisplaysOnInput(SystemState &state, Stream &out) {
     bool wokeAny = false;
-    bool wakeAttempted = false;
 
     if (state.oledReady && gOledSleeping) {
-        wakeAttempted = true;
-        gOled.setPowerSave(0);
-        gOled.setContrast(255);
+        forceOledWakeOn(state);
         gOledSleeping = false;
         wokeAny = true;
         out.println("OLED: wake");
     }
 
     if (state.einkReady && gEinkSleeping) {
-        wakeAttempted = true;
-        out.println("E-ink: wake from sleep...");
-        if (gEink.Init() == 0) {
-            gEinkSleeping = false;
-            gEinkPartialRefreshCounter = 0;
+        if (tryWakeEinkPanel(state, out)) {
             wokeAny = true;
-            out.println("E-ink: awake");
-        } else {
-            // Allow retry through the lazy init path on next render.
-            state.einkReady = false;
-            gEinkInitAttempted = false;
-            out.println("E-ink: wake failed");
+            out.println("E-ink: wake");
         }
     }
 
-    if (wokeAny || wakeAttempted) {
+    if (wokeAny) {
         markDisplayActivity();
-        renderActiveApp(state, out);
     }
 
     return wokeAny;
@@ -881,21 +987,15 @@ bool handleEinkIdleTimeout(SystemState &state, Stream &out) {
 
     bool changed = false;
     if (state.oledReady && !gOledSleeping) {
-        gOled.clearBuffer();
-        gOled.sendBuffer();
-        gOled.setContrast(0);
-        gOled.setPowerSave(1);
+        forceOledSleepOff(state);
         gOledSleeping = true;
         out.println("OLED: idle timeout, going to sleep");
         changed = true;
     }
 
     if (state.einkReady && !gEinkSleeping) {
-        out.println("E-ink: idle timeout, going to sleep");
-        gEink.Clear();
-        gEink.sleep();
-        gEinkPartialRefreshCounter = 0;
         gEinkSleeping = true;
+        out.println("E-ink: marked as sleeping for re-init on wake");
         changed = true;
     }
 

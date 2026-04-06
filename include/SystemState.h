@@ -1,6 +1,8 @@
 #pragma once
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 struct AppConfig {
     String deviceName = "os";
@@ -37,4 +39,8 @@ struct SystemState {
     bool buzzerReady = false;
     bool oledReady = false;
     bool einkReady = false;
+
+    // Mutexes for thread-safe bus access
+    SemaphoreHandle_t i2cMutex = nullptr;
+    SemaphoreHandle_t spiMutex = nullptr;
 };

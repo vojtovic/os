@@ -2,10 +2,13 @@
 
 #include <RTClib.h>
 #include <Wire.h>
+#include <SPI.h>
 
 namespace {
 constexpr uint8_t kI2cSdaPin = 8;
 constexpr uint8_t kI2cSclPin = 9;
+constexpr uint8_t kSpiSckPin = 12;
+constexpr uint8_t kSpiMosiPin = 11;
 constexpr uint8_t kCardKbAddress = 0x5F;
 constexpr uint8_t kBuzzerPin = 4;
 
@@ -40,6 +43,10 @@ bool initHardware(SystemState &state, Stream &out) {
     } else {
         state.i2cReady = true;
     }
+
+    // Initialize SPI bus for displays (Shared SCK=12, MOSI=11)
+    SPI.begin(kSpiSckPin, -1, kSpiMosiPin);
+    out.println("SPI: ready (SCK=12, MOSI=11)");
 
     // RTClib internally starts Wire bus. We avoid explicit Wire.begin() here,
     // so startup log is clean and the bus is initialized exactly once.
@@ -109,39 +116,44 @@ void testBuzzer(const SystemState &state, Stream &out, uint8_t beeps) {
 }
 
 bool tryReadCardKb(SystemState &state, char &ch) {
-    if (!state.cardKbReady) {
+    if (!state.cardKbReady || !state.i2cMutex) {
         return false;
     }
 
-    Wire.requestFrom(static_cast<int>(kCardKbAddress), 1);
-    if (Wire.available() <= 0) {
-        return false;
+    bool success = false;
+    if (xSemaphoreTake(state.i2cMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        Wire.requestFrom(static_cast<int>(kCardKbAddress), 1);
+        if (Wire.available() > 0) {
+            const uint8_t value = Wire.read();
+            if (value != 0) {
+                ch = static_cast<char>(value);
+                success = true;
+            }
+        }
+        xSemaphoreGive(state.i2cMutex);
     }
-
-    const uint8_t value = Wire.read();
-    if (value == 0) {
-        return false;
-    }
-
-    ch = static_cast<char>(value);
-    return true;
+    return success;
 }
 
 bool printRtcNow(const SystemState &state, Stream &out) {
-    if (!state.rtcReady) {
+    if (!state.rtcReady || !state.i2cMutex) {
         out.println("RTC not ready");
         return false;
     }
 
-    const DateTime now = gRtc.now();
-    char timestamp[24];
-    snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d",
-             now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+    if (xSemaphoreTake(state.i2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        const DateTime now = gRtc.now();
+        char timestamp[24];
+        snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d",
+                 now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
 
-    out.print("rtc now: ");
-    out.println(timestamp);
+        out.print("rtc now: ");
+        out.println(timestamp);
 
-    out.print("rtc temp C: ");
-    out.println(gRtc.getTemperature(), 2);
-    return true;
+        out.print("rtc temp C: ");
+        out.println(gRtc.getTemperature(), 2);
+        xSemaphoreGive(state.i2cMutex);
+        return true;
+    }
+    return false;
 }
