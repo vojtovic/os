@@ -120,3 +120,12 @@ The monitor speed is 115200.
 ## Status
 
 This repository is still a work in progress, but the base hardware, storage, display, shell, and task scaffolding are already in place.
+
+## Future Upgrades
+
+Planned follow-up work for the next session:
+
+- make WiFi and Bluetooth scans non-blocking so menus stay responsive
+- move more long-running work out of the foreground UI path
+- continue the web upload app with safer background servicing and better status output
+- keep SD playback as the next larger subsystem after the UI stays responsive

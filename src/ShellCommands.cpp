@@ -2,6 +2,7 @@
 
 #include "DisplayManager.h"
 #include "HardwareManager.h"
+#include "WebUploadManager.h"
 
 namespace {
 String trimCopy(String value) {
@@ -11,6 +12,7 @@ String trimCopy(String value) {
 
 constexpr const char *kLauncherAppIds[] = {
     "settings",
+    "web-upload",
     "apps",
     "serial",
     "about",
@@ -61,6 +63,7 @@ void handleConfigCommand(SystemState &state, const String &args, Stream &out) {
         String value = args.substring(7);
         value.trim();
         state.config.sdEnabled = parseBool(value);
+        invalidateLauncherSdAppCache();
         out.print("Config: sd_enabled=");
         out.println(state.config.sdEnabled ? "true" : "false");
         return;
@@ -82,6 +85,28 @@ void handleConfigCommand(SystemState &state, const String &args, Stream &out) {
 
     out.println("Config: unknown subcommand");
 }
+
+void handleWebUploadCommand(SystemState &state, const String &args, Stream &out) {
+    if (args.isEmpty() || args == "status") {
+        printWebUploadStatus(state, out);
+        return;
+    }
+
+    if (args == "start") {
+        if (startWebUploadServer(state, out)) {
+            out.println("Web upload: started");
+        }
+        return;
+    }
+
+    if (args == "stop") {
+        stopWebUploadServer(out);
+        out.println("Web upload: stopped");
+        return;
+    }
+
+    out.println("Web upload: unknown subcommand");
+}
 }  // namespace
 
 void printShellHelp(Stream &out) {
@@ -99,11 +124,13 @@ void printShellHelp(Stream &out) {
     out.println("config set name <value>");
     out.println("config set sd on|off");
     out.println("config set sd_speed <hz>");
+    out.println("web-upload status|start|stop");
     out.println("display info");
     out.println("launcher show");
     out.println("launcher next");
     out.println("launcher prev");
-    out.println("launcher open <settings|apps|serial|about>");
+    out.println("launcher refresh");
+    out.println("launcher open <settings|web-upload|apps|serial|about>");
     out.println("launcher list");
     out.println("settings show");
     out.println("oled test");
@@ -177,6 +204,12 @@ bool executeShellCommand(SystemState &state, TaskManager &taskManager, const Str
         return true;
     }
 
+    if (line.startsWith("web-upload")) {
+        String args = line.length() > 10 ? trimCopy(line.substring(10)) : String("");
+        handleWebUploadCommand(state, args, out);
+        return true;
+    }
+
     if (line == "display info") {
         out.println("--- Displays ---");
         printDisplayInfo(state, out);
@@ -191,12 +224,21 @@ bool executeShellCommand(SystemState &state, TaskManager &taskManager, const Str
             return true;
         }
 
+        if (args == "refresh" || args == "rescan") {
+            invalidateLauncherSdAppCache();
+            renderLauncherScreen(state, false, out);
+            return true;
+        }
+
         if (args == "list") {
             printLauncherInfo(state, out);
             return true;
         }
 
         if (args == "next" || args == "prev") {
+            if (state.launcher.activeAppId.equalsIgnoreCase("web-upload")) {
+                stopWebUploadServer(out);
+            }
             const int direction = args == "next" ? 1 : -1;
             int nextIndex = static_cast<int>(state.launcher.selectedIndex) + direction;
             if (nextIndex < 0) {
@@ -216,6 +258,10 @@ bool executeShellCommand(SystemState &state, TaskManager &taskManager, const Str
             if (appId.isEmpty()) {
                 out.println("launcher open: missing app id");
                 return true;
+            }
+
+            if (state.launcher.activeAppId.equalsIgnoreCase("web-upload") && !appId.equalsIgnoreCase("web-upload")) {
+                stopWebUploadServer(out);
             }
 
             bool found = false;
@@ -242,6 +288,9 @@ bool executeShellCommand(SystemState &state, TaskManager &taskManager, const Str
     }
 
     if (line == "settings show") {
+        if (state.launcher.activeAppId.equalsIgnoreCase("web-upload")) {
+            stopWebUploadServer(out);
+        }
         state.launcher.activeAppId = "settings";
         renderSettingsScreen(state, false, out);
         return true;

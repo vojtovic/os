@@ -3,7 +3,7 @@
 Use this file as the shared context between agents in this workspace.
 
 ## Current Objective
-- Next focus: readable CardKB keypress logging in the serial console, while keeping Czech localization support and SD playback MVP on the active backlog.
+- Next focus: validate web-upload and launcher responsiveness on-device, while keeping Czech localization and SD playback MVP on the active backlog.
 
 ## Constraints
 - Keep boot stable.
@@ -29,6 +29,13 @@ Use this file as the shared context between agents in this workspace.
 - WiFi scan now shows hidden SSIDs as `skrytá síť <BSSID>` instead of blank labels.
 - Serial monitor logging now prints human-readable CardKB key names plus raw hex codes.
 - CardKB arrow mapping now treats `0x96`/`0xB6` as DOWN and `0x97`/`0xB7` as RIGHT.
+- Added a first web upload app scaffold with a `WebServer`-based upload handler and status screen.
+- Web upload starts only when WiFi STA is connected; upload target prefers SD, then LittleFS.
+- Launcher shortcut `2` now opens the web upload app.
+- Launcher SD app list is now cached so redraws do not reopen the SD card on every render.
+- Added shell commands: `web-upload status|start|stop` and `launcher refresh|rescan`.
+- Web upload server now runs as a background service and can be queried or stopped from shell.
+- `renderStatusScreen` now uses the SPI mutex for OLED writes to avoid display bus contention.
 
 ## Open Questions
 - Confirm exact raw codes for all four arrows on the target CardKB firmware (expected 0x92/0x94/0x96/0x98 or 0xB2/0xB4/0xB6/0xB8).
@@ -37,7 +44,7 @@ Use this file as the shared context between agents in this workspace.
 - Verify WiFi manager UX feels clear on OLED text density (SSID length may overflow on long names).
 
 ## Next Actions
-- Validate the readable keypress logging on-device with the serial monitor.
+- Validate web-upload start/stop/status and launcher refresh on-device.
 - Keep SD playback MVP on the backlog until requested.
 - Continue Czech localization polish only if the user asks for it.
 
@@ -61,6 +68,15 @@ Use this file as the shared context between agents in this workspace.
 - Verify: done, evidence: `platformio run` SUCCESS (2026-04-06) after keypress logging patch, next stage: on-device serial monitor test.
 - Build: done, evidence: corrected DOWN/RIGHT mapping in AppBootstrap + DisplayManager, next stage: verify on device if needed.
 - Verify: done, evidence: `platformio run` SUCCESS (2026-04-06) after arrow mapping fix, next stage: on-device keypress test.
+- Strategy: done, evidence: scoped new web upload app to a small launcher-integrated scaffold using existing WiFi/storage layers, next stage: implement code.
+- Build: done, evidence: added WebServer-based upload module, status screen helper, and launcher/shell wiring, next stage: compile verification.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-06) after web upload app integration, next stage: on-device upload test.
+- Strategy: done, evidence: identified SD manifest reload in launcher as the main hotspot, next stage: cache the manifest.
+- Build: done, evidence: cached launcher SD app list and invalidated it on SD toggle, next stage: compile verification.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-06) after launcher cache fix, next stage: on-device responsiveness check.
+- Strategy: done, evidence: reviewed remaining hotspots with specialist agents and picked low-risk operational fixes, next stage: implement lifecycle and command polish.
+- Build: done, evidence: added web-upload shell commands, background server servicing, launcher refresh, and mutex-safe status rendering, next stage: compile verification.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-06) after the final command/lifecycle polish, next stage: on-device spot check.
 
 ## Last Update
 - Date: 2026-04-06

@@ -5,6 +5,7 @@
 #include "HardwareManager.h"
 #include "SerialShell.h"
 #include "StorageManager.h"
+#include "WebUploadManager.h"
 
 namespace {
 String describeCardKbKey(char ch) {
@@ -165,6 +166,7 @@ void processApplicationLoop(SystemState &state, TaskManager &taskManager) {
     processCardKbInput(state, Serial);
 
     processSerialInput(state, taskManager, Serial);
+    serviceWebUploadServer(state);
     handleEinkIdleTimeout(state, Serial);
     vTaskDelay(pdMS_TO_TICKS(10));
 }

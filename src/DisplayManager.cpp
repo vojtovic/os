@@ -8,6 +8,7 @@
 #include "ConfigStore.h"
 #include "EPD_3in52.h"
 #include "epdpaint.h"
+#include "WebUploadManager.h"
 #include "StorageManager.h"
 
 namespace {
@@ -26,6 +27,7 @@ constexpr uint8_t kOledCs = 10;
 
 constexpr LauncherApp kLauncherApps[] = {
     {"settings", "Settings", "Built-in config app"},
+    {"web-upload", "Web Upload", "Browser file upload"},
     {"apps", "SD Apps", "Loaded from manifest"},
     {"serial", "Serial", "Debug shell"},
     {"about", "About", "System info"},
@@ -57,11 +59,13 @@ bool gEinkInitAttempted = false;
 constexpr size_t kMaxSdApps = 8;
 String gSdApps[kMaxSdApps];
 size_t gSdAppCount = 0;
+bool gSdAppCacheDirty = true;
+bool gSdAppCachePrimed = false;
 uint32_t gLastDisplayActivityMs = 0;
 bool gEinkSleeping = false;
 bool gOledSleeping = false;
 bool gOledHeldInReset = false;
-String gLauncherKeyMessage = "press 1 for settings";
+String gLauncherKeyMessage = "press number to open app";
 
 constexpr const char *kSettingsOptions[] = {
     "1) WiFi manager",
@@ -220,6 +224,23 @@ const LauncherApp &launcherAppAt(uint8_t index) {
     return kLauncherApps[index % kLauncherAppCount];
 }
 
+void refreshLauncherSdApps(const SystemState &state, Stream &out) {
+    if (!state.sdReady) {
+        gSdAppCount = 0;
+        gSdAppCacheDirty = false;
+        gSdAppCachePrimed = true;
+        return;
+    }
+
+    if (gSdAppCachePrimed && !gSdAppCacheDirty) {
+        return;
+    }
+
+    gSdAppCount = loadSdAppManifest(state, gSdApps, kMaxSdApps, out);
+    gSdAppCacheDirty = false;
+    gSdAppCachePrimed = true;
+}
+
 void drawLauncherOled(const SystemState &state) {
     if (!state.oledReady) {
         return;
@@ -256,7 +277,7 @@ void drawLauncherCard(Paint &paint, int x, int y, int width, int height, const L
 }
 
 void drawLauncherPreview(const SystemState &state, Stream &out) {
-    gSdAppCount = loadSdAppManifest(state, gSdApps, kMaxSdApps, out);
+    refreshLauncherSdApps(state, out);
 
     out.println("--- Launcher ---");
     out.print("active app: ");
@@ -1124,8 +1145,8 @@ bool renderLauncherScreen(SystemState &state, bool oledOnly, Stream &out) {
             drawLauncherCard(paint, x, y, cardWidth, cardHeight, kLauncherApps[index], selected);
         }
 
-        paint.DrawStringAt(8, 208, "open settings: press 1 on CardKB", &Font12, kColored);
-        gSdAppCount = loadSdAppManifest(state, gSdApps, kMaxSdApps, out);
+        paint.DrawStringAt(8, 208, "1-5 open apps on CardKB", &Font12, kColored);
+        refreshLauncherSdApps(state, out);
         if (gSdAppCount > 0) {
             paint.DrawStringAt(8, 224, "sd apps:", &Font12, kColored);
             int x = 76;
@@ -1151,6 +1172,11 @@ bool renderLauncherScreen(SystemState &state, bool oledOnly, Stream &out) {
     markDisplayActivity();
     out.println("E-ink: launcher rendered");
     return true;
+}
+
+void invalidateLauncherSdAppCache() {
+    gSdAppCacheDirty = true;
+    gSdAppCachePrimed = false;
 }
 
 bool renderSettingsScreen(SystemState &state, bool oledOnly, Stream &out) {
@@ -1180,6 +1206,49 @@ bool renderSettingsScreen(SystemState &state, bool oledOnly, Stream &out) {
     return true;
 }
 
+bool renderStatusScreen(SystemState &state, const String &title, const String &line1, const String &line2, const String &line3, bool oledOnly, Stream &out) {
+    if (state.oledReady && state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        gOled.clearBuffer();
+        gOled.setFont(u8g2_font_6x10_tf);
+        gOled.drawStr(0, 12, title.c_str());
+        gOled.drawStr(0, 28, line1.c_str());
+        gOled.drawStr(0, 42, line2.c_str());
+        gOled.drawStr(0, 56, line3.c_str());
+        gOled.sendBuffer();
+        xSemaphoreGive(state.spiMutex);
+    }
+
+    if (oledOnly) {
+        return state.oledReady;
+    }
+
+    if (!ensureEinkInitialized(state, out)) {
+        return state.oledReady;
+    }
+
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        Paint paint(gEinkBuffer, kEinkNativeWidth, kEinkNativeHeight);
+        prepareLandscapePaint(paint);
+        paint.Clear(kUncolored);
+        paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
+        paint.DrawStringAt(8, 10, title.c_str(), &Font16, kColored);
+        paint.DrawLine(0, 32, kEinkLandscapeWidth - 1, 32, kColored);
+        paint.DrawStringAt(8, 50, line1.c_str(), &Font12, kColored);
+        paint.DrawStringAt(8, 70, line2.c_str(), &Font12, kColored);
+        paint.DrawStringAt(8, 90, line3.c_str(), &Font12, kColored);
+        gEink.display(paint.GetImage());
+        vTaskDelay(pdMS_TO_TICKS(1));
+        gEink.lut_GC();
+        vTaskDelay(pdMS_TO_TICKS(1));
+        gEink.refresh();
+        vTaskDelay(pdMS_TO_TICKS(5));
+        xSemaphoreGive(state.spiMutex);
+    }
+
+    noteDisplayActivity();
+    return true;
+}
+
 bool renderActiveApp(SystemState &state, bool oledOnly, Stream &out) {
     if (state.launcher.activeAppId.equalsIgnoreCase("launcher")) {
         return renderLauncherScreen(state, oledOnly, out);
@@ -1187,6 +1256,10 @@ bool renderActiveApp(SystemState &state, bool oledOnly, Stream &out) {
 
     if (state.launcher.activeAppId.equalsIgnoreCase("settings")) {
         return renderSettingsScreen(state, oledOnly, out);
+    }
+
+    if (state.launcher.activeAppId.equalsIgnoreCase("web-upload")) {
+        return renderWebUploadScreen(state, oledOnly, out);
     }
 
     return renderPlaceholderApp(state, out);
@@ -1232,6 +1305,14 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             return true;
         }
 
+        if (state.launcher.activeAppId.equalsIgnoreCase("web-upload")) {
+            stopWebUploadServer(out);
+            state.launcher.activeAppId = "launcher";
+            state.settings.lastMessage = "back to launcher";
+            renderLauncherScreen(state, false, out);
+            return true;
+        }
+
         if (!state.launcher.activeAppId.equalsIgnoreCase("launcher")) {
             state.launcher.activeAppId = "launcher";
             renderLauncherScreen(state, false, out);
@@ -1242,19 +1323,24 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
     const char normalizedKey = decodeCardKbKey(key);
 
     if (state.launcher.activeAppId.equalsIgnoreCase("launcher")) {
-        if (normalizedKey == '1') {
-            state.launcher.activeAppId = "settings";
-            state.settings.lastMessage = "opened settings";
-            out.println("Launcher: opening settings");
-            renderSettingsScreen(state, false, out);
-            return true;
+        if (normalizedKey >= '1' && normalizedKey <= '5') {
+            const uint8_t appIndex = static_cast<uint8_t>(normalizedKey - '1');
+            if (appIndex < kLauncherAppCount) {
+                state.launcher.selectedIndex = appIndex;
+                state.launcher.activeAppId = kLauncherApps[appIndex].id;
+                state.settings.lastMessage = String("opened ") + kLauncherApps[appIndex].id;
+                out.print("Launcher: opening ");
+                out.println(kLauncherApps[appIndex].id);
+                renderActiveApp(state, false, out);
+                return true;
+            }
         }
 
         if (normalizedKey >= 32 && normalizedKey <= 126) {
-            gLauncherKeyMessage = String("key: ") + normalizedKey + " (1=settings)";
+            gLauncherKeyMessage = String("key: ") + normalizedKey + " (1..5 open app)";
         } else {
             char rawHex[24];
-            snprintf(rawHex, sizeof(rawHex), "key:0x%02X (1=settings)", static_cast<uint8_t>(key));
+            snprintf(rawHex, sizeof(rawHex), "key:0x%02X (1..5 open app)", static_cast<uint8_t>(key));
             gLauncherKeyMessage = rawHex;
         }
         // Only update OLED for feedback on unused keys.
