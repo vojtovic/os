@@ -78,10 +78,13 @@ constexpr uint8_t kSettingsViewWifiPassword = 2;
 constexpr uint8_t kSettingsViewWifiSelectList = 3;
 constexpr uint8_t kSettingsViewBluetoothList = 4;
 constexpr uint8_t kSettingsViewBluetoothSelectList = 5;
-constexpr size_t kMaxWifiNetworks = 9;
+constexpr size_t kMaxWifiNetworks = 24;
+constexpr size_t kWifiListVisibleCount = 9;
 String gWifiSsidList[kMaxWifiNetworks];
+String gWifiBssidList[kMaxWifiNetworks];
 int32_t gWifiRssiList[kMaxWifiNetworks];
 size_t gWifiCount = 0;
+size_t gWifiListScrollOffset = 0;
 // True while synchronous Wi-Fi scan is running.
 bool gWifiScanInProgress = false;
 constexpr size_t kMaxBluetoothDevices = 9;
@@ -98,6 +101,28 @@ void forceOledSleepOff(SystemState &state);
 void forceOledWakeOn(SystemState &state);
 void drawSettingsOled(const SystemState &state);
 String transliterateCzechToAscii(const String &input);
+String formatWifiDisplayLabel(size_t index);
+bool isCardKbUpArrowCode(uint8_t code);
+bool isCardKbDownArrowCode(uint8_t code);
+
+String formatWifiDisplayLabel(size_t index) {
+    String ssid = gWifiSsidList[index];
+    if (!ssid.isEmpty()) {
+        return ssid;
+    }
+
+    String label = "skrytá síť ";
+    label += gWifiBssidList[index];
+    return label;
+}
+
+bool isCardKbUpArrowCode(uint8_t code) {
+    return code == 0x95 || code == 0xB5;
+}
+
+bool isCardKbDownArrowCode(uint8_t code) {
+    return code == 0x96 || code == 0xB6;
+}
 
 void forceOledSleepOff(SystemState &state) {
     if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -455,11 +480,14 @@ void drawSettingsEink(SystemState &state) {
             paint.DrawStringAt(10, 62, "Scanning networks...", &Font12, kColored);
             paint.DrawStringAt(10, 80, "Please wait", &Font12, kColored);
         } else {
+            const size_t maxOffset = gWifiCount > kWifiListVisibleCount ? gWifiCount - kWifiListVisibleCount : 0;
+            const size_t startIndex = min(gWifiListScrollOffset, maxOffset);
+            const size_t endIndex = min(startIndex + kWifiListVisibleCount, gWifiCount);
             int y = 58;
-            for (size_t i = 0; i < gWifiCount && i < kMaxWifiNetworks; ++i) {
-                String line = String(static_cast<unsigned>(i + 1));
+            for (size_t i = startIndex; i < endIndex; ++i) {
+                String line = String(static_cast<unsigned>((i - startIndex) + 1));
                 line += ") ";
-                line += gWifiSsidList[i];
+                line += formatWifiDisplayLabel(i);
                 line += " (";
                 line += String(static_cast<long>(gWifiRssiList[i]));
                 line += ")";
@@ -469,11 +497,20 @@ void drawSettingsEink(SystemState &state) {
 
             if (gWifiCount == 0) {
                 paint.DrawStringAt(10, 76, "No networks found", &Font12, kColored);
+            } else if (gWifiCount > kWifiListVisibleCount) {
+                String pageLine = String("page ") + String(static_cast<unsigned>(startIndex + 1));
+                pageLine += "-";
+                pageLine += String(static_cast<unsigned>(endIndex));
+                pageLine += "/";
+                pageLine += String(static_cast<unsigned>(gWifiCount));
+                paint.DrawStringAt(10, 202, pageLine.c_str(), &Font12, kColored);
+                paint.DrawStringAt(150, 202, "^ up", &Font12, kColored);
+                paint.DrawStringAt(200, 202, "down", &Font12, kColored);
             }
         }
 
         paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
-        paint.DrawStringAt(10, 218, "Type 1..9 to select, left back", &Font12, kColored);
+        paint.DrawStringAt(10, 218, "1..9 select, up/down page", &Font12, kColored);
     } else if (state.settings.viewMode == kSettingsViewBluetoothList) {
         const String btState = String("bluetooth: ") + (state.settings.btEnabled ? "on" : "off");
         paint.DrawStringAt(10, 42, "Bluetooth manager", &Font16, kColored);
@@ -537,9 +574,11 @@ size_t scanWifiNetworks(Stream &out) {
 
     for (int i = 0; i < found && gWifiCount < kMaxWifiNetworks; ++i) {
         gWifiSsidList[gWifiCount] = WiFi.SSID(i);
+        gWifiBssidList[gWifiCount] = WiFi.BSSIDstr(i);
         gWifiRssiList[gWifiCount] = WiFi.RSSI(i);
         ++gWifiCount;
     }
+    gWifiListScrollOffset = 0;
     out.print("WiFi: found ");
     out.println(gWifiCount);
     return gWifiCount;
@@ -1256,11 +1295,37 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
         }
 
         if (state.settings.viewMode == kSettingsViewWifiSelectList) {
+            const size_t maxOffset = gWifiCount > kWifiListVisibleCount ? gWifiCount - kWifiListVisibleCount : 0;
+
+            if (isCardKbUpArrowCode(rawCode)) {
+                if (gWifiListScrollOffset > 0) {
+                    gWifiListScrollOffset = gWifiListScrollOffset > kWifiListVisibleCount ? gWifiListScrollOffset - kWifiListVisibleCount : 0;
+                    state.settings.lastMessage = "wifi scroll up";
+                    renderSettingsScreen(state, false, out);
+                }
+                return true;
+            }
+
+            if (isCardKbDownArrowCode(rawCode)) {
+                if (gWifiListScrollOffset < maxOffset) {
+                    gWifiListScrollOffset = min(gWifiListScrollOffset + kWifiListVisibleCount, maxOffset);
+                    state.settings.lastMessage = "wifi scroll down";
+                    renderSettingsScreen(state, false, out);
+                }
+                return true;
+            }
+
             if (normalizedKey >= '1' && normalizedKey <= '9') {
                 const uint8_t pick = static_cast<uint8_t>(normalizedKey - '1');
-                if (pick < gWifiCount) {
-                    state.settings.selectedWifiIndex = static_cast<int8_t>(pick);
-                    state.settings.selectedSsid = gWifiSsidList[pick];
+                const size_t absoluteIndex = gWifiListScrollOffset + pick;
+                if (absoluteIndex < gWifiCount) {
+                    if (gWifiSsidList[absoluteIndex].isEmpty()) {
+                        state.settings.lastMessage = "hidden wifi unsupported";
+                        renderSettingsScreen(state, false, out);
+                        return true;
+                    }
+                    state.settings.selectedWifiIndex = static_cast<int8_t>(absoluteIndex);
+                    state.settings.selectedSsid = gWifiSsidList[absoluteIndex];
                     state.settings.wifiPassword = "";
                     state.settings.viewMode = kSettingsViewWifiPassword;
                     state.settings.lastMessage = String("ssid ") + state.settings.selectedSsid;

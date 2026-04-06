@@ -7,28 +7,48 @@
 #include "StorageManager.h"
 
 namespace {
+String describeCardKbKey(char ch) {
+    if (ch == '\r') {
+        return "ENTER";
+    }
+    if (ch == '\n') {
+        return "NEWLINE";
+    }
+    if (ch == 8) {
+        return "BACKSPACE";
+    }
+    if (static_cast<uint8_t>(ch) == 0x94 || static_cast<uint8_t>(ch) == 0xB4) {
+        return "LEFT";
+    }
+    if (static_cast<uint8_t>(ch) == 0x95 || static_cast<uint8_t>(ch) == 0xB5) {
+        return "UP";
+    }
+    if (static_cast<uint8_t>(ch) == 0x96 || static_cast<uint8_t>(ch) == 0xB6) {
+        return "DOWN";
+    }
+    if (static_cast<uint8_t>(ch) == 0x97 || static_cast<uint8_t>(ch) == 0xB7) {
+        return "RIGHT";
+    }
+    if (ch >= 32 && ch <= 126) {
+        String text = "'";
+        text += ch;
+        text += "'";
+        return text;
+    }
+
+    return "NONPRINTABLE";
+}
+
 void logCardKbInput(char ch, Stream &out) {
-    out.print("kb input: 0x");
+    out.print("kb press: ");
+    out.print(describeCardKbKey(ch));
+    out.print(" raw=0x");
     const uint8_t raw = static_cast<uint8_t>(ch);
     if (raw < 16) {
         out.print('0');
     }
     out.print(raw, HEX);
-    out.print(" '");
-
-    if (ch == '\r') {
-        out.print("\\r");
-    } else if (ch == '\n') {
-        out.print("\\n");
-    } else if (ch == 8) {
-        out.print("BACKSPACE");
-    } else if (ch >= 32 && ch <= 126) {
-        out.print(ch);
-    } else {
-        out.print('.');
-    }
-
-    out.println("'");
+    out.println();
 }
 
 void processCardKbInput(SystemState &state, Stream &out) {
@@ -60,19 +80,6 @@ void processCardKbInput(SystemState &state, Stream &out) {
         lastKeyMs = nowMs;
         return;
     }
-
-    out.print("kb key: 0x");
-    if (static_cast<uint8_t>(ch) < 16) {
-        out.print('0');
-    }
-    out.print(static_cast<uint8_t>(ch), HEX);
-    out.print(" '");
-    if (ch >= 32 && ch <= 126) {
-        out.print(ch);
-    } else {
-        out.print('.');
-    }
-    out.println("'");
 
     lastKey = ch;
     lastKeyMs = nowMs;
