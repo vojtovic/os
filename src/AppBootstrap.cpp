@@ -26,8 +26,6 @@ void processCardKbInput(SystemState &state, Stream &out) {
     const bool wokeDisplays = wakeDisplaysOnInput(state, out);
 
     if (handleActiveAppInput(state, ch, out)) {
-        // Keep both displays in sync when the active app handled the key.
-        renderActiveApp(state, out);
         lastKey = ch;
         lastKeyMs = nowMs;
         return;
@@ -35,7 +33,7 @@ void processCardKbInput(SystemState &state, Stream &out) {
 
     if (wokeDisplays) {
         // After wake, restore the active screen on both displays.
-        renderActiveApp(state, out);
+        renderActiveApp(state, false, out);
     }
 
     out.print("kb key: 0x");
@@ -116,7 +114,7 @@ void setupApplication(SystemState &state, TaskManager &taskManager) {
         Serial.println("CardKB live logging: enabled");
     }
 
-    renderLauncherScreen(state, Serial);
+    renderLauncherScreen(state, false, Serial);
 }
 
 void processApplicationLoop(SystemState &state, TaskManager &taskManager) {

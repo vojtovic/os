@@ -517,7 +517,7 @@ bool applySettingsSelection(SystemState &state, uint8_t optionIndex, Stream &out
         state.settings.wifiPassword = "";
         gWifiCount = 0;
         gWifiScanInProgress = true;
-        renderSettingsScreen(state, out);
+        renderSettingsScreen(state, false, out);
         scanWifiNetworks(out);
         gWifiScanInProgress = false;
         state.settings.lastMessage = "select wifi";
@@ -691,10 +691,14 @@ void printLauncherInfo(const SystemState &state, Stream &out) {
     drawLauncherPreview(state, out);
 }
 
-bool renderLauncherScreen(SystemState &state, Stream &out) {
+bool renderLauncherScreen(SystemState &state, bool oledOnly, Stream &out) {
     if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         drawLauncherOled(state);
         xSemaphoreGive(state.spiMutex);
+    }
+
+    if (oledOnly) {
+        return state.oledReady;
     }
 
     if (!ensureEinkInitialized(state, out)) {
@@ -757,8 +761,15 @@ bool renderLauncherScreen(SystemState &state, Stream &out) {
     return true;
 }
 
-bool renderSettingsScreen(SystemState &state, Stream &out) {
-    drawSettingsOled(state);
+bool renderSettingsScreen(SystemState &state, bool oledOnly, Stream &out) {
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        drawSettingsOled(state);
+        xSemaphoreGive(state.spiMutex);
+    }
+
+    if (oledOnly) {
+        return state.oledReady;
+    }
 
     if (!ensureEinkInitialized(state, out)) {
         out.println("OLED: settings rendered");
@@ -766,21 +777,24 @@ bool renderSettingsScreen(SystemState &state, Stream &out) {
     }
 
     // Settings view transitions use full refresh for clean state changes.
-    drawSettingsEink(state);
-    gEinkPartialRefreshCounter = 0;
-    ++gEinkUpdateCounter;
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        drawSettingsEink(state);
+        gEinkPartialRefreshCounter = 0;
+        ++gEinkUpdateCounter;
+        xSemaphoreGive(state.spiMutex);
+    }
     markDisplayActivity();
     out.println("Settings app rendered");
     return true;
 }
 
-bool renderActiveApp(SystemState &state, Stream &out) {
+bool renderActiveApp(SystemState &state, bool oledOnly, Stream &out) {
     if (state.launcher.activeAppId.equalsIgnoreCase("launcher")) {
-        return renderLauncherScreen(state, out);
+        return renderLauncherScreen(state, oledOnly, out);
     }
 
     if (state.launcher.activeAppId.equalsIgnoreCase("settings")) {
-        return renderSettingsScreen(state, out);
+        return renderSettingsScreen(state, oledOnly, out);
     }
 
     return renderPlaceholderApp(state, out);
@@ -795,7 +809,7 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             state.launcher.activeAppId = "settings";
             state.settings.lastMessage = "opened settings";
             out.println("Launcher: opening settings");
-            renderSettingsScreen(state, out);
+            renderSettingsScreen(state, false, out);
             return true;
         }
 
@@ -806,7 +820,8 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             snprintf(rawHex, sizeof(rawHex), "key:0x%02X (1=settings)", static_cast<uint8_t>(key));
             gLauncherKeyMessage = rawHex;
         }
-        drawLauncherOled(state);
+        // Only update OLED for feedback on unused keys.
+        renderLauncherScreen(state, true, out);
         return true;
     }
 
@@ -815,7 +830,7 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             if (normalizedKey == '0') {
                 state.settings.viewMode = kSettingsViewHome;
                 state.settings.lastMessage = "wifi list closed";
-                renderSettingsScreen(state, out);
+                renderSettingsScreen(state, false, out);
                 return true;
             }
 
@@ -828,7 +843,7 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
                     state.settings.wifiPassword = "";
                     state.settings.viewMode = kSettingsViewWifiPassword;
                     state.settings.lastMessage = String("ssid ") + state.settings.selectedSsid;
-                    renderSettingsScreen(state, out);
+                    renderSettingsScreen(state, false, out);
                     return true;
                 }
             }
@@ -841,17 +856,17 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
                 state.settings.viewMode = kSettingsViewWifiList;
                 state.settings.wifiPassword = "";
                 state.settings.lastMessage = "password canceled";
-                renderSettingsScreen(state, out);
+                renderSettingsScreen(state, false, out);
                 return true;
             }
 
             if (normalizedKey == '\n' || normalizedKey == '\r') {
                 // Enter commits connect action and returns to settings home.
                 state.settings.lastMessage = "connecting...";
-                drawSettingsOled(state);
+                renderSettingsScreen(state, true, out);
                 connectSelectedWifi(state, out);
                 state.settings.viewMode = kSettingsViewHome;
-                renderSettingsScreen(state, out);
+                renderSettingsScreen(state, false, out);
                 return true;
             }
 
@@ -860,7 +875,7 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
                     state.settings.wifiPassword.remove(state.settings.wifiPassword.length() - 1);
                 }
                 state.settings.lastMessage = "key: backspace";
-                drawSettingsOled(state);
+                renderSettingsScreen(state, true, out);
                 return true;
             }
 
@@ -869,7 +884,7 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
                     state.settings.wifiPassword += normalizedKey;
                 }
                 state.settings.lastMessage = String("key: ") + normalizedKey;
-                drawSettingsOled(state);
+                renderSettingsScreen(state, true, out);
                 return true;
             }
 
@@ -877,14 +892,14 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             char rawHex[20];
             snprintf(rawHex, sizeof(rawHex), "key:0x%02X", static_cast<uint8_t>(key));
             state.settings.lastMessage = rawHex;
-            drawSettingsOled(state);
+            renderSettingsScreen(state, true, out);
             return true;
         }
 
         if (normalizedKey >= '1' && normalizedKey <= '4') {
             const uint8_t optionIndex = static_cast<uint8_t>(normalizedKey - '1');
             if (applySettingsSelection(state, optionIndex, out)) {
-                renderSettingsScreen(state, out);
+                renderSettingsScreen(state, false, out);
                 return true;
             }
             return false;
@@ -893,7 +908,7 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
         if (normalizedKey == '0') {
             state.launcher.activeAppId = "launcher";
             state.settings.lastMessage = "back to launcher";
-            renderLauncherScreen(state, out);
+            renderLauncherScreen(state, false, out);
             return true;
         }
 

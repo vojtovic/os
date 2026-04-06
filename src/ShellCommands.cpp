@@ -187,7 +187,7 @@ bool executeShellCommand(SystemState &state, TaskManager &taskManager, const Str
         String args = line.length() > 8 ? trimCopy(line.substring(8)) : String("");
 
         if (args.isEmpty() || args == "show") {
-            renderLauncherScreen(state, out);
+            renderLauncherScreen(state, false, out);
             return true;
         }
 
@@ -207,7 +207,7 @@ bool executeShellCommand(SystemState &state, TaskManager &taskManager, const Str
             }
             state.launcher.selectedIndex = static_cast<uint8_t>(nextIndex);
             state.launcher.activeAppId = kLauncherAppIds[state.launcher.selectedIndex];
-            renderLauncherScreen(state, out);
+            renderLauncherScreen(state, false, out);
             return true;
         }
 
@@ -233,7 +233,7 @@ bool executeShellCommand(SystemState &state, TaskManager &taskManager, const Str
                 return true;
             }
 
-            renderActiveApp(state, out);
+            renderActiveApp(state, false, out);
             return true;
         }
 
@@ -243,7 +243,7 @@ bool executeShellCommand(SystemState &state, TaskManager &taskManager, const Str
 
     if (line == "settings show") {
         state.launcher.activeAppId = "settings";
-        renderSettingsScreen(state, out);
+        renderSettingsScreen(state, false, out);
         return true;
     }
 
