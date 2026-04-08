@@ -1,0 +1,225 @@
+#include "SettingsInputManager.h"
+
+bool handleSettingsAppInput(
+    SystemState &state,
+    char key,
+    char normalizedKey,
+    uint8_t rawCode,
+    uint8_t settingsViewWifiList,
+    uint8_t settingsViewWifiPassword,
+    uint8_t settingsViewWifiSelectList,
+    uint8_t settingsViewBluetoothList,
+    uint8_t settingsViewBluetoothSelectList,
+    uint8_t settingsViewHome,
+    SettingsInputContext &context,
+    Stream &out) {
+    if (state.settings.viewMode == settingsViewWifiList) {
+        if (normalizedKey == '1') {
+            context.toggleWifiEnabled(state, out);
+            context.renderSettingsScreen(state, false, out);
+            return true;
+        }
+
+        if (normalizedKey == '2') {
+            if (!state.settings.wifiEnabled) {
+                state.settings.lastMessage = "enable wifi first";
+                context.renderSettingsScreen(state, false, out);
+                return true;
+            }
+
+            state.settings.viewMode = settingsViewWifiSelectList;
+            state.settings.selectedWifiIndex = -1;
+            state.settings.selectedSsid = "";
+            state.settings.wifiPassword = "";
+            state.settings.lastMessage = "wifi scanning";
+            *context.wifiCount = 0;
+            *context.wifiScanInProgress = true;
+            context.renderSettingsScreen(state, false, out);
+            context.scanWifiNetworks(out);
+            *context.wifiScanInProgress = false;
+            state.settings.lastMessage = "select wifi";
+            context.renderSettingsScreen(state, false, out);
+            return true;
+        }
+        return false;
+    }
+
+    if (state.settings.viewMode == settingsViewWifiSelectList) {
+        const size_t maxOffset = *context.wifiCount > context.wifiListVisibleCount ? *context.wifiCount - context.wifiListVisibleCount : 0;
+
+        if (context.isUpArrowCode(rawCode)) {
+            if (*context.wifiListScrollOffset > 0) {
+                *context.wifiListScrollOffset = *context.wifiListScrollOffset > context.wifiListVisibleCount ? *context.wifiListScrollOffset - context.wifiListVisibleCount : 0;
+                state.settings.lastMessage = "wifi scroll up";
+                context.renderSettingsScreen(state, false, out);
+            }
+            return true;
+        }
+
+        if (context.isDownArrowCode(rawCode)) {
+            if (*context.wifiListScrollOffset < maxOffset) {
+                *context.wifiListScrollOffset = min(*context.wifiListScrollOffset + context.wifiListVisibleCount, maxOffset);
+                state.settings.lastMessage = "wifi scroll down";
+                context.renderSettingsScreen(state, false, out);
+            }
+            return true;
+        }
+
+        if (normalizedKey >= '1' && normalizedKey <= '9') {
+            const uint8_t pick = static_cast<uint8_t>(normalizedKey - '1');
+            const size_t absoluteIndex = *context.wifiListScrollOffset + pick;
+            if (absoluteIndex < *context.wifiCount) {
+                if (context.wifiSsidList[absoluteIndex].isEmpty()) {
+                    state.settings.lastMessage = "hidden wifi unsupported";
+                    context.renderSettingsScreen(state, false, out);
+                    return true;
+                }
+                state.settings.selectedWifiIndex = static_cast<int8_t>(absoluteIndex);
+                state.settings.selectedSsid = context.wifiSsidList[absoluteIndex];
+                state.settings.wifiPassword = "";
+                state.settings.viewMode = settingsViewWifiPassword;
+                state.settings.lastMessage = String("ssid ") + state.settings.selectedSsid;
+                context.renderSettingsScreen(state, false, out);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (state.settings.viewMode == settingsViewBluetoothList) {
+        if (normalizedKey == '1') {
+            context.toggleBluetoothEnabled(state, out);
+            context.renderSettingsScreen(state, false, out);
+            return true;
+        }
+
+        if (normalizedKey == '2') {
+            if (!state.settings.btEnabled) {
+                state.settings.lastMessage = "enable bt first";
+                context.renderSettingsScreen(state, false, out);
+                return true;
+            }
+
+            state.settings.viewMode = settingsViewBluetoothSelectList;
+            state.settings.selectedBluetoothIndex = -1;
+            state.settings.btConnectedDeviceName = "";
+            state.settings.btConnected = false;
+            state.settings.lastMessage = "bt scanning";
+            *context.bluetoothDeviceCount = 0;
+            *context.bluetoothScanInProgress = true;
+            context.renderSettingsScreen(state, false, out);
+            context.scanBluetoothDevices(out);
+            *context.bluetoothScanInProgress = false;
+            state.settings.lastMessage = "select bt";
+            context.renderSettingsScreen(state, false, out);
+            return true;
+        }
+
+        return false;
+    }
+
+    if (state.settings.viewMode == settingsViewBluetoothSelectList) {
+        if (normalizedKey >= '1' && normalizedKey <= '9') {
+            const uint8_t pick = static_cast<uint8_t>(normalizedKey - '1');
+            if (pick < *context.bluetoothDeviceCount) {
+                state.settings.selectedBluetoothIndex = static_cast<int8_t>(pick);
+                state.settings.btConnectedDeviceName = context.bluetoothDeviceList[pick];
+                state.settings.btConnected = true;
+                state.settings.lastMessage = String("bt connected ") + state.settings.btConnectedDeviceName;
+                state.settings.viewMode = settingsViewBluetoothList;
+                context.renderSettingsScreen(state, false, out);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (state.settings.viewMode == settingsViewWifiPassword) {
+        // Password mode intentionally updates only OLED on typing keys.
+        if (normalizedKey == '0') {
+            *context.czechComposeDeadKey = 0;
+            state.settings.viewMode = settingsViewWifiSelectList;
+            state.settings.wifiPassword = "";
+            state.settings.lastMessage = "password canceled";
+            context.renderSettingsScreen(state, false, out);
+            return true;
+        }
+
+        if (normalizedKey == '\n' || normalizedKey == '\r') {
+            *context.czechComposeDeadKey = 0;
+            // Enter commits connect action and returns to settings home.
+            state.settings.lastMessage = "connecting...";
+            context.renderSettingsScreen(state, true, out);
+            context.connectSelectedWifi(state, out);
+            state.settings.viewMode = settingsViewHome;
+            context.renderSettingsScreen(state, false, out);
+            return true;
+        }
+
+        if (normalizedKey == 8 || normalizedKey == 127) {
+            *context.czechComposeDeadKey = 0;
+            if (!state.settings.wifiPassword.isEmpty()) {
+                state.settings.wifiPassword.remove(state.settings.wifiPassword.length() - 1);
+            }
+            state.settings.lastMessage = "key: backspace";
+            context.renderSettingsScreen(state, true, out);
+            return true;
+        }
+
+        if (normalizedKey >= 32 && normalizedKey <= 126) {
+            char composeKey = normalizedKey;
+            if (composeKey == '/') {
+                composeKey = '^';
+            }
+
+            if (composeKey == '^' || composeKey == '\'' || composeKey == '"') {
+                if (context.tryApplyPostfixCzechCompose(state.settings.wifiPassword, composeKey)) {
+                    state.settings.lastMessage = "compose postfix";
+                    context.renderSettingsScreen(state, true, out);
+                    return true;
+                }
+            }
+
+            String typed;
+            context.decodeCzechComposeKey(composeKey, typed);
+
+            if (typed.isEmpty()) {
+                state.settings.lastMessage = "compose...";
+                context.renderSettingsScreen(state, true, out);
+                return true;
+            }
+
+            if (state.settings.wifiPassword.length() + typed.length() < 63) {
+                state.settings.wifiPassword += typed;
+            }
+            state.settings.lastMessage = String("key: ") + typed;
+            context.renderSettingsScreen(state, true, out);
+            return true;
+        }
+
+        // Keep unsupported key presses visible for debugging CardKB mapping.
+        char rawHex[20];
+        snprintf(rawHex, sizeof(rawHex), "key:0x%02X", static_cast<uint8_t>(key));
+        state.settings.lastMessage = rawHex;
+        context.renderSettingsScreen(state, true, out);
+        return true;
+    }
+
+    if (normalizedKey >= '1' && normalizedKey <= '5') {
+        const uint8_t optionIndex = static_cast<uint8_t>(normalizedKey - '1');
+        if (context.applySettingsSelection(state, optionIndex, out)) {
+            context.renderSettingsScreen(state, false, out);
+            return true;
+        }
+        return false;
+    }
+
+    if (normalizedKey == '0') {
+        state.launcher.activeAppId = "launcher";
+        state.settings.lastMessage = "back to launcher";
+        context.renderLauncherScreen(state, false, out);
+        return true;
+    }
+
+    return false;
+}

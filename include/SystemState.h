@@ -12,7 +12,7 @@ struct AppConfig {
 
 struct LauncherState {
     uint8_t selectedIndex = 0;
-    String activeAppId = "launcher";
+    String activeAppId = "desktop";
 };
 
 struct SettingsState {
@@ -34,10 +34,26 @@ struct SettingsState {
     int8_t selectedBluetoothIndex = -1;
 };
 
+struct FileManagerState {
+    String currentPath = "/";
+    String statusMessage = "ready";
+    String clipboardPath = "";
+    String menuTargetPath = "";
+    String pendingFolderName = "";
+    bool clipboardActive = false;
+    bool clipboardMove = false;
+    bool menuTargetIsDir = false;
+    uint8_t viewMode = 0;
+    uint8_t selectedIndex = 0;
+    size_t scrollOffset = 0;
+    uint8_t menuIndex = 0;
+};
+
 struct SystemState {
     AppConfig config;
     LauncherState launcher;
     SettingsState settings;
+    FileManagerState fileManager;
     bool littleFsReady = false;
     bool sdReady = false;
     bool i2cReady = false;

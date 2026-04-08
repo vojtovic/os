@@ -12,6 +12,7 @@ String trimCopy(String value) {
 
 constexpr const char *kLauncherAppIds[] = {
     "settings",
+    "file-manager",
     "web-upload",
     "apps",
     "serial",
@@ -130,7 +131,7 @@ void printShellHelp(Stream &out) {
     out.println("launcher next");
     out.println("launcher prev");
     out.println("launcher refresh");
-    out.println("launcher open <settings|web-upload|apps|serial|about>");
+    out.println("launcher open <settings|file-manager|web-upload|apps|serial|about>");
     out.println("launcher list");
     out.println("settings show");
     out.println("oled test");

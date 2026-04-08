@@ -180,6 +180,11 @@ size_t loadSdAppManifest(const SystemState &state, String *appIds, size_t maxApp
         return 0;
     }
 
+    if (!SD.exists(kSdAppsManifest)) {
+        out.println("SD apps: manifest not found (/apps/apps.txt)");
+        return 0;
+    }
+
     File file = SD.open(kSdAppsManifest, FILE_READ);
     if (!file) {
         out.println("SD apps: manifest not found (/apps/apps.txt)");

@@ -1,13 +1,15 @@
 #include "DisplayManager.h"
 
 #include <U8g2lib.h>
-#include <WiFi.h>
-#include <BLEDevice.h>
+#include <SD.h>
 #include <freertos/task.h>
 
+#include "AppRouter.h"
 #include "ConfigStore.h"
 #include "EPD_3in52.h"
 #include "epdpaint.h"
+#include "SettingsConnectivityService.h"
+#include "SettingsInputManager.h"
 #include "WebUploadManager.h"
 #include "StorageManager.h"
 
@@ -27,6 +29,7 @@ constexpr uint8_t kOledCs = 10;
 
 constexpr LauncherApp kLauncherApps[] = {
     {"settings", "Settings", "Built-in config app"},
+    {"file-manager", "File Manager", "SD file browser"},
     {"web-upload", "Web Upload", "Browser file upload"},
     {"apps", "SD Apps", "Loaded from manifest"},
     {"serial", "Serial", "Debug shell"},
@@ -65,7 +68,8 @@ uint32_t gLastDisplayActivityMs = 0;
 bool gEinkSleeping = false;
 bool gOledSleeping = false;
 bool gOledHeldInReset = false;
-String gLauncherKeyMessage = "press number to open app";
+String gLauncherKeyMessage = "1..6 open, down=next page";
+constexpr size_t kLauncherPageSize = 6;
 
 constexpr const char *kSettingsOptions[] = {
     "1) WiFi manager",
@@ -108,6 +112,9 @@ String transliterateCzechToAscii(const String &input);
 String formatWifiDisplayLabel(size_t index);
 bool isCardKbUpArrowCode(uint8_t code);
 bool isCardKbDownArrowCode(uint8_t code);
+bool isCardKbRightArrowCode(uint8_t code);
+bool isCardKbLeftArrowCode(uint8_t code);
+void prepareLandscapePaint(Paint &paint);
 
 String formatWifiDisplayLabel(size_t index) {
     String ssid = gWifiSsidList[index];
@@ -126,6 +133,944 @@ bool isCardKbUpArrowCode(uint8_t code) {
 
 bool isCardKbDownArrowCode(uint8_t code) {
     return code == 0x96 || code == 0xB6;
+}
+
+bool isCardKbRightArrowCode(uint8_t code) {
+    return code == 0x97 || code == 0xB7;
+}
+
+constexpr uint8_t kFileManagerViewBrowse = 0;
+constexpr uint8_t kFileManagerViewItemMenu = 1;
+constexpr uint8_t kFileManagerViewDirectoryMenu = 2;
+constexpr uint8_t kFileManagerViewCreateFolder = 3;
+constexpr size_t kFileManagerMaxEntries = 24;
+constexpr size_t kFileManagerPageSize = 6;
+
+String gFileManagerCachedPath;
+bool gFileManagerCacheDirty = true;
+String gFileManagerEntryNames[kFileManagerMaxEntries];
+String gFileManagerEntryPaths[kFileManagerMaxEntries];
+bool gFileManagerEntryIsDir[kFileManagerMaxEntries];
+uint32_t gFileManagerEntrySizes[kFileManagerMaxEntries];
+size_t gFileManagerEntryCount = 0;
+
+String fileManagerBaseName(const String &path) {
+    int slash = path.lastIndexOf('/');
+    if (slash < 0) {
+        slash = path.lastIndexOf('\\');
+    }
+    if (slash < 0) {
+        return path;
+    }
+    return path.substring(slash + 1);
+}
+
+String fileManagerNormalizePath(String path) {
+    path.trim();
+    if (path.isEmpty()) {
+        return String("/");
+    }
+
+    path.replace('\\', '/');
+    if (!path.startsWith("/")) {
+        path = String("/") + path;
+    }
+
+    while (path.length() > 1 && path.endsWith("/")) {
+        path.remove(path.length() - 1);
+    }
+
+    return path;
+}
+
+String fileManagerParentPath(const String &path) {
+    String normalized = fileManagerNormalizePath(path);
+    if (normalized == "/") {
+        return normalized;
+    }
+
+    int slash = normalized.lastIndexOf('/');
+    if (slash <= 0) {
+        return String("/");
+    }
+
+    return normalized.substring(0, slash);
+}
+
+String fileManagerJoinPath(const String &parentPath, const String &childName) {
+    String child = childName;
+    child.trim();
+    if (child.isEmpty()) {
+        return fileManagerNormalizePath(parentPath);
+    }
+
+    if (child.startsWith("/")) {
+        return fileManagerNormalizePath(child);
+    }
+
+    if (!parentPath.isEmpty() && child.startsWith(parentPath)) {
+        return fileManagerNormalizePath(child);
+    }
+
+    String joined = fileManagerNormalizePath(parentPath);
+    if (joined == "/") {
+        joined += child;
+    } else {
+        joined += "/";
+        joined += child;
+    }
+    return fileManagerNormalizePath(joined);
+}
+
+bool fileManagerPathExists(const String &path) {
+    return SD.exists(fileManagerNormalizePath(path));
+}
+
+void invalidateFileManagerCache() {
+    gFileManagerCacheDirty = true;
+    gFileManagerCachedPath = "";
+}
+
+void fileManagerSetStatus(SystemState &state, const String &message) {
+    state.fileManager.statusMessage = message;
+}
+
+void fileManagerResetBrowseSelection(SystemState &state) {
+    state.fileManager.selectedIndex = 0;
+    state.fileManager.scrollOffset = 0;
+    state.fileManager.menuIndex = 0;
+}
+
+bool fileManagerIsInsideSourcePath(const String &sourcePath, const String &destinationPath) {
+    if (destinationPath == sourcePath) {
+        return true;
+    }
+
+    String sourcePrefix = sourcePath;
+    if (!sourcePrefix.endsWith("/")) {
+        sourcePrefix += "/";
+    }
+    return destinationPath.startsWith(sourcePrefix);
+}
+
+String fileManagerUniqueChildPath(const String &directoryPath, const String &baseName) {
+    String candidate = fileManagerJoinPath(directoryPath, baseName);
+    if (!fileManagerPathExists(candidate)) {
+        return candidate;
+    }
+
+    String stem = baseName;
+    String extension;
+    int dot = baseName.lastIndexOf('.');
+    if (dot > 0 && dot < static_cast<int>(baseName.length()) - 1) {
+        stem = baseName.substring(0, dot);
+        extension = baseName.substring(dot);
+    }
+
+    for (uint8_t suffix = 2; suffix < 100; ++suffix) {
+        String name = stem + String("_copy");
+        if (suffix > 2) {
+            name += String(suffix);
+        }
+        name += extension;
+        candidate = fileManagerJoinPath(directoryPath, name);
+        if (!fileManagerPathExists(candidate)) {
+            return candidate;
+        }
+    }
+
+    return String();
+}
+
+bool fileManagerDeleteRecursive(const String &path, Stream &out);
+bool fileManagerCopyRecursive(const String &sourcePath, const String &destinationPath, Stream &out);
+
+size_t fileManagerRefreshListing(SystemState &state, Stream &out) {
+    if (!state.sdReady) {
+        gFileManagerEntryCount = 0;
+        fileManagerSetStatus(state, "SD not ready");
+        return 0;
+    }
+
+    const String currentPath = fileManagerNormalizePath(state.fileManager.currentPath);
+    if (!gFileManagerCacheDirty && gFileManagerCachedPath == currentPath) {
+        return gFileManagerEntryCount;
+    }
+
+    gFileManagerCachedPath = currentPath;
+    gFileManagerEntryCount = 0;
+
+    File dir = SD.open(currentPath, FILE_READ);
+    if (!dir || !dir.isDirectory()) {
+        fileManagerSetStatus(state, String("open failed: ") + currentPath);
+        gFileManagerCacheDirty = false;
+        return 0;
+    }
+
+    if (currentPath != "/") {
+        gFileManagerEntryNames[gFileManagerEntryCount] = "..";
+        gFileManagerEntryPaths[gFileManagerEntryCount] = fileManagerParentPath(currentPath);
+        gFileManagerEntryIsDir[gFileManagerEntryCount] = true;
+        gFileManagerEntrySizes[gFileManagerEntryCount] = 0;
+        ++gFileManagerEntryCount;
+    }
+
+    File entry = dir.openNextFile();
+    while (entry && gFileManagerEntryCount < kFileManagerMaxEntries) {
+        String entryName = entry.name();
+        gFileManagerEntryNames[gFileManagerEntryCount] = fileManagerBaseName(entryName);
+        gFileManagerEntryPaths[gFileManagerEntryCount] = fileManagerJoinPath(currentPath, entryName);
+        gFileManagerEntryIsDir[gFileManagerEntryCount] = entry.isDirectory();
+        gFileManagerEntrySizes[gFileManagerEntryCount] = static_cast<uint32_t>(entry.size());
+        ++gFileManagerEntryCount;
+        entry = dir.openNextFile();
+    }
+
+    dir.close();
+    gFileManagerCacheDirty = false;
+    if (gFileManagerEntryCount == 0) {
+        fileManagerSetStatus(state, String("empty: ") + currentPath);
+    }
+    return gFileManagerEntryCount;
+}
+
+bool fileManagerCreateFolder(SystemState &state, const String &folderName, Stream &out) {
+    String cleanName = folderName;
+    cleanName.trim();
+    if (cleanName.isEmpty()) {
+        fileManagerSetStatus(state, "folder name empty");
+        return false;
+    }
+
+    cleanName.replace('/', '_');
+    cleanName.replace('\\', '_');
+    const String targetPath = fileManagerJoinPath(state.fileManager.currentPath, cleanName);
+    if (fileManagerPathExists(targetPath)) {
+        fileManagerSetStatus(state, "folder exists");
+        return false;
+    }
+
+    if (!SD.mkdir(targetPath)) {
+        fileManagerSetStatus(state, "mkdir failed");
+        out.print("File manager: mkdir failed ");
+        out.println(targetPath);
+        return false;
+    }
+
+    invalidateFileManagerCache();
+    fileManagerSetStatus(state, String("created ") + cleanName);
+    return true;
+}
+
+bool fileManagerDeleteRecursive(const String &path, Stream &out) {
+    const String normalized = fileManagerNormalizePath(path);
+    if (normalized == "/") {
+        out.println("File manager: refusing to delete root");
+        return false;
+    }
+
+    File entry = SD.open(normalized, FILE_READ);
+    if (!entry) {
+        out.print("File manager: delete open failed ");
+        out.println(normalized);
+        return false;
+    }
+
+    if (!entry.isDirectory()) {
+        entry.close();
+        if (!SD.remove(normalized)) {
+            out.print("File manager: remove failed ");
+            out.println(normalized);
+            return false;
+        }
+        return true;
+    }
+
+    File child = entry.openNextFile();
+    while (child) {
+        const String childPath = fileManagerJoinPath(normalized, child.name());
+        child.close();
+        if (!fileManagerDeleteRecursive(childPath, out)) {
+            entry.close();
+            return false;
+        }
+        child = entry.openNextFile();
+    }
+
+    entry.close();
+    if (!SD.rmdir(normalized)) {
+        out.print("File manager: rmdir failed ");
+        out.println(normalized);
+        return false;
+    }
+
+    return true;
+}
+
+bool fileManagerCopyRecursive(const String &sourcePath, const String &destinationPath, Stream &out) {
+    const String normalizedSource = fileManagerNormalizePath(sourcePath);
+    const String normalizedDestination = fileManagerNormalizePath(destinationPath);
+
+    if (fileManagerIsInsideSourcePath(normalizedSource, normalizedDestination)) {
+        out.println("File manager: invalid copy target");
+        return false;
+    }
+
+    File source = SD.open(normalizedSource, FILE_READ);
+    if (!source) {
+        out.print("File manager: copy open failed ");
+        out.println(normalizedSource);
+        return false;
+    }
+
+    if (!source.isDirectory()) {
+        File destination = SD.open(normalizedDestination, FILE_WRITE);
+        if (!destination) {
+            source.close();
+            out.print("File manager: copy create failed ");
+            out.println(normalizedDestination);
+            return false;
+        }
+
+        uint8_t buffer[512];
+        while (source.available()) {
+            const size_t readCount = source.read(buffer, sizeof(buffer));
+            if (readCount == 0) {
+                break;
+            }
+            if (destination.write(buffer, readCount) != readCount) {
+                destination.close();
+                source.close();
+                out.print("File manager: copy write failed ");
+                out.println(normalizedDestination);
+                return false;
+            }
+        }
+
+        destination.close();
+        source.close();
+        return true;
+    }
+
+    if (!SD.mkdir(normalizedDestination)) {
+        source.close();
+        out.print("File manager: mkdir copy failed ");
+        out.println(normalizedDestination);
+        return false;
+    }
+
+    File child = source.openNextFile();
+    while (child) {
+        const String childSource = fileManagerJoinPath(normalizedSource, child.name());
+        const String childDestination = fileManagerJoinPath(normalizedDestination, fileManagerBaseName(child.name()));
+        child.close();
+        if (!fileManagerCopyRecursive(childSource, childDestination, out)) {
+            source.close();
+            return false;
+        }
+        child = source.openNextFile();
+    }
+
+    source.close();
+    return true;
+}
+
+bool fileManagerPasteClipboard(SystemState &state, Stream &out) {
+    if (!state.fileManager.clipboardActive || state.fileManager.clipboardPath.isEmpty()) {
+        fileManagerSetStatus(state, "clipboard empty");
+        return false;
+    }
+
+    const String sourcePath = fileManagerNormalizePath(state.fileManager.clipboardPath);
+    const String sourceName = fileManagerBaseName(sourcePath);
+    const String targetDir = fileManagerNormalizePath(state.fileManager.currentPath);
+    const String targetPath = state.fileManager.clipboardMove
+        ? fileManagerJoinPath(targetDir, sourceName)
+        : fileManagerUniqueChildPath(targetDir, sourceName);
+
+    if (targetPath.isEmpty()) {
+        fileManagerSetStatus(state, "no free name");
+        return false;
+    }
+
+    if (state.fileManager.clipboardMove) {
+        if (targetPath == sourcePath) {
+            fileManagerSetStatus(state, "already here");
+            state.fileManager.clipboardActive = false;
+            state.fileManager.clipboardPath = "";
+            state.fileManager.clipboardMove = false;
+            return true;
+        }
+
+        if (fileManagerPathExists(targetPath)) {
+            fileManagerSetStatus(state, "target exists");
+            return false;
+        }
+    }
+
+    if (!fileManagerCopyRecursive(sourcePath, targetPath, out)) {
+        fileManagerSetStatus(state, "paste failed");
+        return false;
+    }
+
+    if (state.fileManager.clipboardMove) {
+        if (!fileManagerDeleteRecursive(sourcePath, out)) {
+            fileManagerSetStatus(state, "move cleanup failed");
+            return false;
+        }
+    }
+
+    state.fileManager.clipboardActive = false;
+    state.fileManager.clipboardPath = "";
+    state.fileManager.clipboardMove = false;
+    invalidateFileManagerCache();
+    fileManagerSetStatus(state, String("pasted to ") + targetDir);
+    return true;
+}
+
+String fileManagerItemDisplayName(size_t index) {
+    if (index >= gFileManagerEntryCount) {
+        return String();
+    }
+    return gFileManagerEntryNames[index];
+}
+
+String fileManagerItemPath(size_t index) {
+    if (index >= gFileManagerEntryCount) {
+        return String();
+    }
+    return gFileManagerEntryPaths[index];
+}
+
+String fileManagerCurrentSelectionLabel(const SystemState &state) {
+    if (state.fileManager.selectedIndex >= gFileManagerEntryCount) {
+        return String();
+    }
+
+    String label = gFileManagerEntryIsDir[state.fileManager.selectedIndex] ? "[D] " : "[F] ";
+    label += fileManagerItemDisplayName(state.fileManager.selectedIndex);
+    return label;
+}
+
+void drawFileManagerOled(const SystemState &state) {
+    if (!state.oledReady) {
+        return;
+    }
+
+    gOled.clearBuffer();
+    gOled.setFont(u8g2_font_4x6_tf);
+    gOled.drawStr(0, 7, "FILE MANAGER");
+    gOled.setCursor(0, 14);
+    gOled.print(state.fileManager.currentPath);
+
+    if (state.fileManager.viewMode == kFileManagerViewCreateFolder) {
+        gOled.drawStr(0, 24, "new folder");
+        gOled.setCursor(0, 35);
+        gOled.print("name: ");
+        gOled.print(state.fileManager.pendingFolderName);
+        gOled.print('_');
+        gOled.drawStr(0, 48, "enter save");
+        gOled.drawStr(0, 58, "<- cancel");
+        gOled.sendBuffer();
+        return;
+    }
+
+    if (state.fileManager.viewMode == kFileManagerViewDirectoryMenu) {
+        gOled.drawStr(0, 24, "directory actions");
+        gOled.drawStr(0, 35, state.fileManager.currentPath.c_str());
+        gOled.drawStr(0, 46, state.fileManager.menuIndex == 0 ? "> 1 new folder" : "  1 new folder");
+        gOled.drawStr(0, 56, state.fileManager.menuIndex == 1 ? "> 2 refresh" : "  2 refresh");
+        gOled.drawStr(80, 56, "<- cancel");
+        gOled.sendBuffer();
+        return;
+    }
+
+    if (state.fileManager.viewMode == kFileManagerViewItemMenu) {
+        const String targetLabel = fileManagerItemDisplayName(state.fileManager.selectedIndex);
+        gOled.drawStr(0, 24, gFileManagerEntryIsDir[state.fileManager.selectedIndex] ? "folder menu" : "file menu");
+        gOled.setCursor(0, 35);
+        gOled.print(targetLabel);
+        const bool isDir = gFileManagerEntryIsDir[state.fileManager.selectedIndex];
+        size_t optionRow = 0;
+        if (isDir) {
+            gOled.drawStr(0, 46, state.fileManager.menuIndex == 0 ? "> 1 open" : "  1 open");
+            gOled.drawStr(0, 56, state.fileManager.menuIndex == 1 ? "> 2 delete" : "  2 delete");
+            optionRow = 2;
+            gOled.drawStr(80, 46, state.fileManager.menuIndex == 2 ? "> 3 copy" : "  3 copy");
+            gOled.drawStr(80, 56, state.fileManager.menuIndex == 3 ? "> 4 move" : "  4 move");
+        } else {
+            gOled.drawStr(0, 46, state.fileManager.menuIndex == 0 ? "> 1 delete" : "  1 delete");
+            gOled.drawStr(0, 56, state.fileManager.menuIndex == 1 ? "> 2 copy" : "  2 copy");
+            optionRow = 2;
+            gOled.drawStr(80, 46, state.fileManager.menuIndex == 2 ? "> 3 move" : "  3 move");
+        }
+        (void)optionRow;
+        gOled.drawStr(0, 64, "<- cancel");
+        gOled.sendBuffer();
+        return;
+    }
+
+    const size_t totalCount = gFileManagerEntryCount;
+    const size_t startIndex = min(state.fileManager.scrollOffset, totalCount > kFileManagerPageSize ? totalCount - kFileManagerPageSize : size_t(0));
+    const size_t endIndex = min(startIndex + kFileManagerPageSize, totalCount);
+    const size_t pageCount = totalCount == 0 ? 1 : ((totalCount + kFileManagerPageSize - 1) / kFileManagerPageSize);
+    const size_t pageIndex = totalCount == 0 ? 0 : (startIndex / kFileManagerPageSize);
+
+    gOled.drawStr(0, 22, "browse");
+    gOled.setCursor(48, 22);
+    gOled.print(pageIndex + 1);
+    gOled.print("/");
+    gOled.print(pageCount);
+
+    int y = 32;
+    for (size_t index = startIndex; index < endIndex; ++index) {
+        String line = (index == state.fileManager.selectedIndex) ? ">" : " ";
+        line += String(static_cast<unsigned>((index - startIndex) + 1));
+        line += " ";
+        line += gFileManagerEntryIsDir[index] ? "[D] " : "[F] ";
+        line += fileManagerItemDisplayName(index);
+        gOled.drawStr(0, y, line.c_str());
+        y += 8;
+    }
+
+    while (y <= 58) {
+        gOled.drawStr(0, y, "");
+        y += 8;
+    }
+
+    gOled.setCursor(0, 64);
+    gOled.print(state.fileManager.clipboardActive ? "right=paste " : "right=new ");
+    gOled.print(state.fileManager.statusMessage);
+    gOled.sendBuffer();
+}
+
+void drawFileManagerEink(const SystemState &state) {
+    Paint paint(gEinkBuffer, kEinkNativeWidth, kEinkNativeHeight);
+    prepareLandscapePaint(paint);
+    paint.Clear(kUncolored);
+    paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
+    paint.DrawStringAt(8, 10, "FILE MANAGER", &Font16, kColored);
+    paint.DrawStringAtUtf8(8, 26, state.fileManager.currentPath.c_str(), &Font12, kColored);
+
+    if (state.fileManager.viewMode == kFileManagerViewCreateFolder) {
+        paint.DrawStringAt(8, 48, "new folder", &Font12, kColored);
+        paint.DrawStringAtUtf8(8, 66, state.fileManager.pendingFolderName.c_str(), &Font12, kColored);
+        paint.DrawStringAt(8, 84, "enter=save", &Font12, kColored);
+        paint.DrawStringAt(8, 100, "left=cancel", &Font12, kColored);
+    } else if (state.fileManager.viewMode == kFileManagerViewDirectoryMenu) {
+        paint.DrawStringAt(8, 48, "directory actions", &Font12, kColored);
+        paint.DrawStringAtUtf8(8, 66, state.fileManager.currentPath.c_str(), &Font12, kColored);
+        paint.DrawStringAt(8, 84, state.fileManager.menuIndex == 0 ? "> 1 new folder" : "  1 new folder", &Font12, kColored);
+        paint.DrawStringAt(8, 100, state.fileManager.menuIndex == 1 ? "> 2 refresh" : "  2 refresh", &Font12, kColored);
+        paint.DrawStringAt(8, 118, "left=cancel", &Font12, kColored);
+    } else if (state.fileManager.viewMode == kFileManagerViewItemMenu) {
+        const bool isDir = gFileManagerEntryIsDir[state.fileManager.selectedIndex];
+        paint.DrawStringAt(8, 48, isDir ? "folder menu" : "file menu", &Font12, kColored);
+        paint.DrawStringAtUtf8(8, 66, fileManagerItemDisplayName(state.fileManager.selectedIndex).c_str(), &Font12, kColored);
+        if (isDir) {
+            paint.DrawStringAt(8, 84, state.fileManager.menuIndex == 0 ? "> 1 open" : "  1 open", &Font12, kColored);
+            paint.DrawStringAt(8, 100, state.fileManager.menuIndex == 1 ? "> 2 delete" : "  2 delete", &Font12, kColored);
+            paint.DrawStringAt(140, 84, state.fileManager.menuIndex == 2 ? "> 3 copy" : "  3 copy", &Font12, kColored);
+            paint.DrawStringAt(140, 100, state.fileManager.menuIndex == 3 ? "> 4 move" : "  4 move", &Font12, kColored);
+        } else {
+            paint.DrawStringAt(8, 84, state.fileManager.menuIndex == 0 ? "> 1 delete" : "  1 delete", &Font12, kColored);
+            paint.DrawStringAt(8, 100, state.fileManager.menuIndex == 1 ? "> 2 copy" : "  2 copy", &Font12, kColored);
+            paint.DrawStringAt(140, 84, state.fileManager.menuIndex == 2 ? "> 3 move" : "  3 move", &Font12, kColored);
+        }
+        paint.DrawStringAt(8, 118, "left=cancel", &Font12, kColored);
+    } else {
+        const size_t totalCount = gFileManagerEntryCount;
+        const size_t startIndex = min(state.fileManager.scrollOffset, totalCount > kFileManagerPageSize ? totalCount - kFileManagerPageSize : size_t(0));
+        const size_t endIndex = min(startIndex + kFileManagerPageSize, totalCount);
+        const size_t pageCount = totalCount == 0 ? 1 : ((totalCount + kFileManagerPageSize - 1) / kFileManagerPageSize);
+        const size_t pageIndex = totalCount == 0 ? 0 : (startIndex / kFileManagerPageSize);
+        String pageLine = String("page ") + String(static_cast<unsigned>(pageIndex + 1)) + "/" + String(static_cast<unsigned>(pageCount));
+        paint.DrawStringAt(200, 26, pageLine.c_str(), &Font12, kColored);
+        paint.DrawLine(0, 38, kEinkLandscapeWidth - 1, 38, kColored);
+
+        int y = 48;
+        for (size_t index = startIndex; index < endIndex; ++index) {
+            String line = String(static_cast<unsigned>((index - startIndex) + 1));
+            line += ".";
+            line += gFileManagerEntryIsDir[index] ? "[D] " : "[F] ";
+            line += fileManagerItemDisplayName(index);
+            if (index == state.fileManager.selectedIndex) {
+                line = String("> ") + line;
+            } else {
+                line = String("  ") + line;
+            }
+            paint.DrawStringAtUtf8(8, y, line.c_str(), &Font12, kColored);
+            y += 16;
+        }
+
+        if (totalCount == 0) {
+            paint.DrawStringAt(8, 58, "empty directory", &Font12, kColored);
+        }
+
+        paint.DrawStringAt(8, 218, state.fileManager.clipboardActive ? "1..6 open/menu, up/down page, right=paste" : "1..6 open/menu, up/down page, right=new", &Font12, kColored);
+    }
+
+    gEink.display(paint.GetImage());
+    vTaskDelay(pdMS_TO_TICKS(1));
+    gEink.lut_GC();
+    vTaskDelay(pdMS_TO_TICKS(1));
+    gEink.refresh();
+    vTaskDelay(pdMS_TO_TICKS(5));
+}
+
+void fileManagerEnterDirectory(SystemState &state, const String &path, Stream &out) {
+    state.fileManager.currentPath = fileManagerNormalizePath(path);
+    state.fileManager.viewMode = kFileManagerViewBrowse;
+    fileManagerResetBrowseSelection(state);
+    invalidateFileManagerCache();
+    fileManagerRefreshListing(state, out);
+}
+
+bool fileManagerExecuteSelection(SystemState &state, Stream &out) {
+    if (state.fileManager.selectedIndex >= gFileManagerEntryCount) {
+        fileManagerSetStatus(state, "selection empty");
+        return false;
+    }
+
+    const String selectedPath = fileManagerItemPath(state.fileManager.selectedIndex);
+    const bool selectedIsDir = gFileManagerEntryIsDir[state.fileManager.selectedIndex];
+
+    if (state.fileManager.menuTargetIsDir) {
+        switch (state.fileManager.menuIndex) {
+            case 0:
+                if (selectedIsDir) {
+                    fileManagerEnterDirectory(state, selectedPath, out);
+                    fileManagerSetStatus(state, String("open ") + fileManagerItemDisplayName(state.fileManager.selectedIndex));
+                    return true;
+                }
+                return false;
+            case 1:
+                if (fileManagerDeleteRecursive(selectedPath, out)) {
+                    invalidateFileManagerCache();
+                    fileManagerRefreshListing(state, out);
+                    fileManagerSetStatus(state, String("deleted ") + fileManagerItemDisplayName(state.fileManager.selectedIndex));
+                    return true;
+                }
+                fileManagerSetStatus(state, "delete failed");
+                return false;
+            case 2:
+                state.fileManager.clipboardPath = selectedPath;
+                state.fileManager.clipboardMove = false;
+                state.fileManager.clipboardActive = true;
+                fileManagerSetStatus(state, String("copied ") + fileManagerItemDisplayName(state.fileManager.selectedIndex));
+                return true;
+            case 3:
+                state.fileManager.clipboardPath = selectedPath;
+                state.fileManager.clipboardMove = true;
+                state.fileManager.clipboardActive = true;
+                fileManagerSetStatus(state, String("cut ") + fileManagerItemDisplayName(state.fileManager.selectedIndex));
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    switch (state.fileManager.menuIndex) {
+        case 0:
+            if (fileManagerDeleteRecursive(selectedPath, out)) {
+                invalidateFileManagerCache();
+                fileManagerRefreshListing(state, out);
+                fileManagerSetStatus(state, String("deleted ") + fileManagerItemDisplayName(state.fileManager.selectedIndex));
+                return true;
+            }
+            fileManagerSetStatus(state, "delete failed");
+            return false;
+        case 1:
+            state.fileManager.clipboardPath = selectedPath;
+            state.fileManager.clipboardMove = false;
+            state.fileManager.clipboardActive = true;
+            fileManagerSetStatus(state, String("copied ") + fileManagerItemDisplayName(state.fileManager.selectedIndex));
+            return true;
+        case 2:
+            state.fileManager.clipboardPath = selectedPath;
+            state.fileManager.clipboardMove = true;
+            state.fileManager.clipboardActive = true;
+            fileManagerSetStatus(state, String("cut ") + fileManagerItemDisplayName(state.fileManager.selectedIndex));
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool fileManagerHandleBrowseInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out) {
+    const size_t totalCount = gFileManagerEntryCount;
+    const size_t pageCount = totalCount == 0 ? 1 : ((totalCount + kFileManagerPageSize - 1) / kFileManagerPageSize);
+
+    if (isCardKbUpArrowCode(rawCode)) {
+        if (state.fileManager.scrollOffset >= kFileManagerPageSize) {
+            state.fileManager.scrollOffset -= kFileManagerPageSize;
+        } else {
+            state.fileManager.scrollOffset = 0;
+        }
+        state.fileManager.selectedIndex = static_cast<uint8_t>(state.fileManager.scrollOffset);
+        fileManagerSetStatus(state, "page up");
+        return true;
+    }
+
+    if (isCardKbDownArrowCode(rawCode) && pageCount > 1) {
+        const size_t maxOffset = totalCount > kFileManagerPageSize ? totalCount - kFileManagerPageSize : 0;
+        state.fileManager.scrollOffset = min(state.fileManager.scrollOffset + kFileManagerPageSize, maxOffset);
+        state.fileManager.selectedIndex = static_cast<uint8_t>(state.fileManager.scrollOffset);
+        fileManagerSetStatus(state, "page down");
+        return true;
+    }
+
+    if (isCardKbRightArrowCode(rawCode)) {
+        if (state.fileManager.clipboardActive) {
+            if (fileManagerPasteClipboard(state, out)) {
+                fileManagerRefreshListing(state, out);
+                return true;
+            }
+            return true;
+        }
+
+        state.fileManager.viewMode = kFileManagerViewDirectoryMenu;
+        state.fileManager.menuIndex = 0;
+        fileManagerSetStatus(state, "directory actions");
+        return true;
+    }
+
+    if (normalizedKey >= '1' && normalizedKey <= '6') {
+        const size_t localIndex = static_cast<size_t>(normalizedKey - '1');
+        const size_t absoluteIndex = state.fileManager.scrollOffset + localIndex;
+        if (absoluteIndex < totalCount) {
+            state.fileManager.selectedIndex = static_cast<uint8_t>(absoluteIndex);
+            state.fileManager.viewMode = kFileManagerViewItemMenu;
+            state.fileManager.menuIndex = 0;
+            state.fileManager.menuTargetPath = fileManagerItemPath(absoluteIndex);
+            state.fileManager.menuTargetIsDir = gFileManagerEntryIsDir[absoluteIndex];
+            fileManagerSetStatus(state, String("selected ") + fileManagerItemDisplayName(absoluteIndex));
+            return true;
+        }
+    }
+
+    if (normalizedKey == '\r' || normalizedKey == '\n') {
+        fileManagerSetStatus(state, "pick 1..6 or arrow keys");
+        return true;
+    }
+
+    if (normalizedKey >= 32 && normalizedKey <= 126) {
+        fileManagerSetStatus(state, String("key: ") + normalizedKey);
+        return true;
+    }
+
+    return false;
+}
+
+bool fileManagerHandleItemMenuInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out) {
+    const bool isDir = state.fileManager.menuTargetIsDir;
+    const uint8_t optionCount = isDir ? 4 : 3;
+
+    if (isCardKbUpArrowCode(rawCode)) {
+        if (state.fileManager.menuIndex == 0) {
+            state.fileManager.menuIndex = optionCount - 1;
+        } else {
+            --state.fileManager.menuIndex;
+        }
+        return true;
+    }
+
+    if (isCardKbDownArrowCode(rawCode)) {
+        state.fileManager.menuIndex = static_cast<uint8_t>((state.fileManager.menuIndex + 1) % optionCount);
+        return true;
+    }
+
+    if (normalizedKey == '\r' || normalizedKey == '\n') {
+        if (state.fileManager.menuIndex == 0 && isDir) {
+            fileManagerEnterDirectory(state, state.fileManager.menuTargetPath, out);
+            return true;
+        }
+
+        if (state.fileManager.menuIndex == (isDir ? 1 : 0)) {
+            if (fileManagerDeleteRecursive(state.fileManager.menuTargetPath, out)) {
+                invalidateFileManagerCache();
+                fileManagerRefreshListing(state, out);
+                fileManagerSetStatus(state, "deleted item");
+                state.fileManager.viewMode = kFileManagerViewBrowse;
+                return true;
+            }
+            fileManagerSetStatus(state, "delete failed");
+            return true;
+        }
+
+        if (state.fileManager.menuIndex == (isDir ? 2 : 1)) {
+            state.fileManager.clipboardPath = state.fileManager.menuTargetPath;
+            state.fileManager.clipboardMove = false;
+            state.fileManager.clipboardActive = true;
+            state.fileManager.viewMode = kFileManagerViewBrowse;
+            fileManagerSetStatus(state, "copy ready");
+            return true;
+        }
+
+        if (state.fileManager.menuIndex == (isDir ? 3 : 2)) {
+            state.fileManager.clipboardPath = state.fileManager.menuTargetPath;
+            state.fileManager.clipboardMove = true;
+            state.fileManager.clipboardActive = true;
+            state.fileManager.viewMode = kFileManagerViewBrowse;
+            fileManagerSetStatus(state, "move ready");
+            return true;
+        }
+
+        return false;
+    }
+
+    if (isCardKbLeftArrowCode(rawCode)) {
+        state.fileManager.viewMode = kFileManagerViewBrowse;
+        state.fileManager.menuIndex = 0;
+        fileManagerSetStatus(state, "menu canceled");
+        return true;
+    }
+
+    if (normalizedKey >= '1' && normalizedKey <= '4') {
+        state.fileManager.menuIndex = static_cast<uint8_t>(normalizedKey - '1');
+        return true;
+    }
+
+    return false;
+}
+
+bool fileManagerHandleDirectoryMenuInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out) {
+    if (isCardKbUpArrowCode(rawCode) || isCardKbDownArrowCode(rawCode)) {
+        state.fileManager.menuIndex = static_cast<uint8_t>((state.fileManager.menuIndex + 1) % 2);
+        return true;
+    }
+
+    if (normalizedKey == '\r' || normalizedKey == '\n') {
+        if (state.fileManager.menuIndex == 0) {
+            state.fileManager.viewMode = kFileManagerViewCreateFolder;
+            state.fileManager.pendingFolderName = "";
+            fileManagerSetStatus(state, "type new folder name");
+            return true;
+        }
+
+        invalidateFileManagerCache();
+        fileManagerRefreshListing(state, out);
+        fileManagerSetStatus(state, "refreshed");
+        state.fileManager.viewMode = kFileManagerViewBrowse;
+        return true;
+    }
+
+    if (isCardKbLeftArrowCode(rawCode)) {
+        state.fileManager.viewMode = kFileManagerViewBrowse;
+        state.fileManager.menuIndex = 0;
+        fileManagerSetStatus(state, "menu canceled");
+        return true;
+    }
+
+    if (normalizedKey >= '1' && normalizedKey <= '2') {
+        state.fileManager.menuIndex = static_cast<uint8_t>(normalizedKey - '1');
+        return true;
+    }
+
+    return false;
+}
+
+bool fileManagerHandleCreateFolderInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out) {
+    if (isCardKbLeftArrowCode(rawCode)) {
+        state.fileManager.viewMode = kFileManagerViewBrowse;
+        state.fileManager.pendingFolderName = "";
+        fileManagerSetStatus(state, "create canceled");
+        return true;
+    }
+
+    if (normalizedKey == '\r' || normalizedKey == '\n') {
+        if (fileManagerCreateFolder(state, state.fileManager.pendingFolderName, out)) {
+            state.fileManager.viewMode = kFileManagerViewBrowse;
+            state.fileManager.pendingFolderName = "";
+            fileManagerRefreshListing(state, out);
+            return true;
+        }
+        return true;
+    }
+
+    if (normalizedKey == 8 || normalizedKey == 127) {
+        if (!state.fileManager.pendingFolderName.isEmpty()) {
+            state.fileManager.pendingFolderName.remove(state.fileManager.pendingFolderName.length() - 1);
+        }
+        fileManagerSetStatus(state, "editing name");
+        return true;
+    }
+
+    if (normalizedKey >= 32 && normalizedKey <= 126) {
+        if (normalizedKey != '/' && normalizedKey != '\\') {
+            if (state.fileManager.pendingFolderName.length() < 32) {
+                state.fileManager.pendingFolderName += normalizedKey;
+            }
+            fileManagerSetStatus(state, String("name: ") + state.fileManager.pendingFolderName);
+        }
+        return true;
+    }
+
+    return false;
+}
+
+void fileManagerResetSession(SystemState &state) {
+    state.fileManager.currentPath = "/";
+    state.fileManager.statusMessage = "ready";
+    state.fileManager.clipboardPath = "";
+    state.fileManager.menuTargetPath = "";
+    state.fileManager.pendingFolderName = "";
+    state.fileManager.clipboardActive = false;
+    state.fileManager.clipboardMove = false;
+    state.fileManager.menuTargetIsDir = false;
+    state.fileManager.viewMode = kFileManagerViewBrowse;
+    state.fileManager.selectedIndex = 0;
+    state.fileManager.scrollOffset = 0;
+    state.fileManager.menuIndex = 0;
+    invalidateFileManagerCache();
+}
+
+bool fileManagerHandleBackInput(SystemState &state, uint8_t rawCode, Stream &out) {
+    if (!isCardKbLeftArrowCode(rawCode)) {
+        return false;
+    }
+
+    if (state.fileManager.viewMode == kFileManagerViewCreateFolder) {
+        state.fileManager.viewMode = kFileManagerViewBrowse;
+        state.fileManager.pendingFolderName = "";
+        fileManagerSetStatus(state, "create canceled");
+        return true;
+    }
+
+    if (state.fileManager.viewMode == kFileManagerViewItemMenu || state.fileManager.viewMode == kFileManagerViewDirectoryMenu) {
+        state.fileManager.viewMode = kFileManagerViewBrowse;
+        state.fileManager.menuIndex = 0;
+        fileManagerSetStatus(state, "menu canceled");
+        return true;
+    }
+
+    if (state.fileManager.currentPath != "/") {
+        fileManagerEnterDirectory(state, fileManagerParentPath(state.fileManager.currentPath), out);
+        fileManagerSetStatus(state, "back");
+        return true;
+    }
+
+    state.launcher.activeAppId = "launcher";
+    state.settings.lastMessage = "back to launcher";
+    return true;
+}
+
+bool handleFileManagerAppInput(SystemState &state, char key, char normalizedKey, uint8_t rawCode, Stream &out) {
+    (void)key;
+
+    if (state.fileManager.viewMode == kFileManagerViewItemMenu) {
+        return fileManagerHandleItemMenuInput(state, normalizedKey, rawCode, out);
+    }
+
+    if (state.fileManager.viewMode == kFileManagerViewDirectoryMenu) {
+        return fileManagerHandleDirectoryMenuInput(state, normalizedKey, rawCode, out);
+    }
+
+    if (state.fileManager.viewMode == kFileManagerViewCreateFolder) {
+        return fileManagerHandleCreateFolderInput(state, normalizedKey, rawCode, out);
+    }
+
+    return fileManagerHandleBrowseInput(state, normalizedKey, rawCode, out);
 }
 
 void forceOledSleepOff(SystemState &state) {
@@ -224,6 +1169,73 @@ const LauncherApp &launcherAppAt(uint8_t index) {
     return kLauncherApps[index % kLauncherAppCount];
 }
 
+size_t launcherTotalItemCount() {
+    return kLauncherAppCount + gSdAppCount;
+}
+
+bool launcherItemIsBuiltin(size_t absoluteIndex) {
+    return absoluteIndex < kLauncherAppCount;
+}
+
+String launcherItemTitleAt(size_t absoluteIndex) {
+    if (launcherItemIsBuiltin(absoluteIndex)) {
+        return String(kLauncherApps[absoluteIndex].title);
+    }
+
+    const size_t sdIndex = absoluteIndex - kLauncherAppCount;
+    if (sdIndex < gSdAppCount) {
+        return gSdApps[sdIndex];
+    }
+    return String("unknown");
+}
+
+String launcherItemIdAt(size_t absoluteIndex) {
+    if (launcherItemIsBuiltin(absoluteIndex)) {
+        return String(kLauncherApps[absoluteIndex].id);
+    }
+
+    const size_t sdIndex = absoluteIndex - kLauncherAppCount;
+    if (sdIndex < gSdAppCount) {
+        return String("sdapp:") + gSdApps[sdIndex];
+    }
+    return String("unknown");
+}
+
+String truncateWithEllipsis(const String &input, size_t maxChars) {
+    if (input.length() <= maxChars) {
+        return input;
+    }
+
+    if (maxChars <= 3) {
+        return String("...");
+    }
+
+    return input.substring(0, maxChars - 3) + String("...");
+}
+
+String launcherIconLabelAt(size_t absoluteIndex) {
+    const String id = launcherItemIdAt(absoluteIndex);
+    if (id.equalsIgnoreCase("settings")) {
+        return String("ST");
+    }
+    if (id.equalsIgnoreCase("file-manager")) {
+        return String("FM");
+    }
+    if (id.equalsIgnoreCase("web-upload")) {
+        return String("UP");
+    }
+    if (id.equalsIgnoreCase("apps")) {
+        return String("AP");
+    }
+    if (id.equalsIgnoreCase("serial")) {
+        return String("SH");
+    }
+    if (id.equalsIgnoreCase("about")) {
+        return String("AB");
+    }
+    return String("SD");
+}
+
 void refreshLauncherSdApps(const SystemState &state, Stream &out) {
     if (!state.sdReady) {
         gSdAppCount = 0;
@@ -246,34 +1258,109 @@ void drawLauncherOled(const SystemState &state) {
         return;
     }
 
-    const LauncherApp &selected = launcherAppAt(state.launcher.selectedIndex);
+    const size_t totalCount = launcherTotalItemCount();
+    const size_t safeIndex = totalCount == 0 ? 0 : min(static_cast<size_t>(state.launcher.selectedIndex), totalCount - 1);
+    const size_t pageCount = totalCount == 0 ? 1 : ((totalCount + kLauncherPageSize - 1) / kLauncherPageSize);
+    const size_t pageIndex = totalCount == 0 ? 0 : (safeIndex / kLauncherPageSize);
+    const size_t startIndex = pageIndex * kLauncherPageSize;
+    const size_t endIndex = min(startIndex + kLauncherPageSize, totalCount);
+
     gOled.clearBuffer();
-    gOled.setFont(u8g2_font_6x10_tf);
-    gOled.drawStr(0, 11, "app launcher");
-    gOled.drawStr(0, 24, state.config.deviceName.c_str());
+    gOled.setFont(u8g2_font_4x6_tf);
+    gOled.setCursor(0, 7);
+    gOled.print("launcher ");
+    gOled.print(pageIndex + 1);
+    gOled.print("/");
+    gOled.print(pageCount);
 
-    gOled.setCursor(0, 38);
-    gOled.print("active: ");
-    gOled.print(state.launcher.activeAppId);
+    int y = 15;
+    for (size_t i = startIndex; i < endIndex; ++i) {
+        String line = "[";
+        line += launcherIconLabelAt(i);
+        line += "] ";
+        line += String(static_cast<unsigned>((i - startIndex) + 1));
+        line += ".";
+        line += truncateWithEllipsis(launcherItemTitleAt(i), 22);
+        gOled.setCursor(0, y);
+        gOled.print(line);
+        y += 8;
+    }
 
-    gOled.setCursor(0, 50);
-    gOled.print("> ");
-    gOled.print(selected.title);
+    while (y <= 55) {
+        gOled.setCursor(0, y);
+        gOled.print("-");
+        y += 8;
+    }
 
-    gOled.setCursor(0, 62);
+    gOled.setCursor(0, 63);
     gOled.print(gLauncherKeyMessage);
     gOled.sendBuffer();
 }
 
-void drawLauncherCard(Paint &paint, int x, int y, int width, int height, const LauncherApp &app, bool selected) {
+void drawLauncherCard(Paint &paint, int x, int y, int width, int height, const String &numberedTitle, bool selected) {
     paint.DrawRectangle(x, y, x + width, y + height, kColored);
     if (selected) {
         paint.DrawRectangle(x + 1, y + 1, x + width - 1, y + height - 1, kColored);
     }
 
-    paint.DrawStringAt(x + 6, y + 8, app.title, &Font16, kColored);
-    paint.DrawStringAt(x + 6, y + 30, app.description, &Font12, kColored);
-    paint.DrawStringAt(x + 6, y + height - 18, app.id, &Font8, kColored);
+    paint.DrawStringAtUtf8(x + 8, y + 42, truncateWithEllipsis(numberedTitle, 20).c_str(), &Font12, kColored);
+}
+
+void drawLauncherIcon(Paint &paint, int x, int y, int size, const String &itemId) {
+    const int x2 = x + size;
+    const int y2 = y + size;
+    paint.DrawRectangle(x, y, x2, y2, kColored);
+
+    if (itemId.equalsIgnoreCase("settings")) {
+        const int cx = x + size / 2;
+        const int cy = y + size / 2;
+        paint.DrawCircle(cx, cy, 5, kColored);
+        paint.DrawLine(cx, y + 1, cx, y + 5, kColored);
+        paint.DrawLine(cx, y2 - 1, cx, y2 - 5, kColored);
+        paint.DrawLine(x + 1, cy, x + 5, cy, kColored);
+        paint.DrawLine(x2 - 1, cy, x2 - 5, cy, kColored);
+        return;
+    }
+
+    if (itemId.equalsIgnoreCase("web-upload")) {
+        const int cx = x + size / 2;
+        paint.DrawLine(cx, y + 3, cx, y2 - 7, kColored);
+        paint.DrawLine(cx, y + 3, cx - 4, y + 8, kColored);
+        paint.DrawLine(cx, y + 3, cx + 4, y + 8, kColored);
+        paint.DrawRectangle(x + 3, y2 - 6, x2 - 3, y2 - 3, kColored);
+        return;
+    }
+
+    if (itemId.equalsIgnoreCase("apps")) {
+        paint.DrawRectangle(x + 3, y + 3, x + 8, y + 8, kColored);
+        paint.DrawRectangle(x + 10, y + 3, x + 15, y + 8, kColored);
+        paint.DrawRectangle(x + 3, y + 10, x + 8, y + 15, kColored);
+        paint.DrawRectangle(x + 10, y + 10, x + 15, y + 15, kColored);
+        return;
+    }
+
+    if (itemId.equalsIgnoreCase("serial")) {
+        paint.DrawRectangle(x + 2, y + 3, x2 - 2, y2 - 3, kColored);
+        paint.DrawLine(x + 5, y + 8, x + 9, y + 11, kColored);
+        paint.DrawLine(x + 5, y + 14, x + 9, y + 11, kColored);
+        paint.DrawLine(x + 11, y + 14, x + 16, y + 14, kColored);
+        return;
+    }
+
+    if (itemId.equalsIgnoreCase("about")) {
+        const int cx = x + size / 2;
+        const int cy = y + size / 2;
+        paint.DrawCircle(cx, cy, 7, kColored);
+        paint.DrawLine(cx, cy - 2, cx, cy + 4, kColored);
+        paint.DrawCircle(cx, cy - 5, 1, kColored);
+        return;
+    }
+
+    // Default SD app icon: simple document shape.
+    paint.DrawRectangle(x + 4, y + 3, x2 - 4, y2 - 3, kColored);
+    paint.DrawLine(x2 - 9, y + 3, x2 - 4, y + 8, kColored);
+    paint.DrawLine(x + 7, y + 10, x2 - 7, y + 10, kColored);
+    paint.DrawLine(x + 7, y + 14, x2 - 7, y + 14, kColored);
 }
 
 void drawLauncherPreview(const SystemState &state, Stream &out) {
@@ -282,26 +1369,18 @@ void drawLauncherPreview(const SystemState &state, Stream &out) {
     out.println("--- Launcher ---");
     out.print("active app: ");
     out.println(state.launcher.activeAppId);
-    out.print("selected: ");
-    out.println(launcherAppAt(state.launcher.selectedIndex).title);
+    const size_t totalCount = launcherTotalItemCount();
+    out.print("items: ");
+    out.println(totalCount);
 
-    for (size_t index = 0; index < kLauncherAppCount; ++index) {
-        out.print(index == state.launcher.selectedIndex ? "* " : "  ");
-        out.print(kLauncherApps[index].id);
-        out.print(" - ");
-        out.println(kLauncherApps[index].description);
-    }
-
-    out.println("--- SD Apps ---");
-    if (gSdAppCount == 0) {
-        out.println("(none)");
-        return;
-    }
-
-    for (size_t i = 0; i < gSdAppCount; ++i) {
+    for (size_t i = 0; i < totalCount; ++i) {
+        out.print(i == state.launcher.selectedIndex ? "* " : "  ");
         out.print(i + 1);
         out.print(". ");
-        out.println(gSdApps[i]);
+        out.print(launcherItemTitleAt(i));
+        out.print(" [");
+        out.print(launcherItemIdAt(i));
+        out.println("]");
     }
 }
 
@@ -580,157 +1659,34 @@ void drawSettingsEink(SystemState &state) {
 
 
 size_t scanWifiNetworks(Stream &out) {
-    // Blocking scan is acceptable here because it runs in explicit user flow.
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect(false, false);
-    delay(50);
-
-    out.println("WiFi: scanning...");
-    const int found = WiFi.scanNetworks(false, true);
-    gWifiCount = 0;
-    if (found <= 0) {
-        out.println("WiFi: no networks");
-        return 0;
-    }
-
-    for (int i = 0; i < found && gWifiCount < kMaxWifiNetworks; ++i) {
-        gWifiSsidList[gWifiCount] = WiFi.SSID(i);
-        gWifiBssidList[gWifiCount] = WiFi.BSSIDstr(i);
-        gWifiRssiList[gWifiCount] = WiFi.RSSI(i);
-        ++gWifiCount;
-    }
-    gWifiListScrollOffset = 0;
-    out.print("WiFi: found ");
-    out.println(gWifiCount);
+    gWifiCount = settingsServiceScanWifiNetworks(
+        gWifiSsidList,
+        gWifiBssidList,
+        gWifiRssiList,
+        kMaxWifiNetworks,
+        gWifiListScrollOffset,
+        out);
     return gWifiCount;
 }
 
 bool toggleWifiEnabled(SystemState &state, Stream &out) {
-    if (state.settings.wifiEnabled) {
-        WiFi.disconnect(true, false);
-        WiFi.mode(WIFI_OFF);
-        state.settings.wifiEnabled = false;
-        state.settings.wifiConnected = false;
-        state.settings.wifiConnectedSsid = "";
-        state.settings.wifiIp = "";
-        state.settings.lastMessage = "wifi disabled";
-        out.println("WiFi: disabled");
-        return true;
-    }
-
-    WiFi.mode(WIFI_STA);
-    state.settings.wifiEnabled = true;
-    state.settings.wifiConnected = (WiFi.status() == WL_CONNECTED);
-    if (state.settings.wifiConnected) {
-        state.settings.wifiConnectedSsid = WiFi.SSID();
-        state.settings.wifiIp = WiFi.localIP().toString();
-    }
-    state.settings.lastMessage = "wifi enabled";
-    out.println("WiFi: enabled");
-    return true;
+    return settingsServiceToggleWifi(state, out);
 }
 
 bool connectSelectedWifi(SystemState &state, Stream &out) {
-    if (state.settings.selectedSsid.isEmpty()) {
-        state.settings.lastMessage = "no ssid";
-        return false;
-    }
-
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(state.settings.selectedSsid.c_str(), state.settings.wifiPassword.c_str());
-
-    const uint32_t startMs = millis();
-    // Simple connection timeout to avoid freezing settings flow.
-    while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < 15000UL) {
-        delay(200);
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        state.settings.wifiEnabled = true;
-        state.settings.wifiConnected = true;
-        state.settings.wifiConnectedSsid = state.settings.selectedSsid;
-        state.settings.wifiIp = WiFi.localIP().toString();
-        state.settings.lastMessage = String("connected ") + state.settings.wifiIp;
-        out.print("WiFi connected: ");
-        out.println(state.settings.wifiIp);
-        return true;
-    }
-
-    state.settings.wifiConnected = false;
-    state.settings.wifiIp = "";
-    state.settings.lastMessage = "wifi connect fail";
-    out.println("WiFi connect failed");
-    return false;
+    return settingsServiceConnectSelectedWifi(state, out);
 }
 
 bool toggleBluetoothEnabled(SystemState &state, Stream &out) {
-    if (state.settings.btEnabled) {
-        state.settings.btEnabled = false;
-        state.settings.btConnected = false;
-        state.settings.btConnectedDeviceName = "";
-        state.settings.selectedBluetoothIndex = -1;
-        state.settings.lastMessage = "bt disabled";
-        out.println("Bluetooth: disabled");
-        return true;
-    }
-
-    state.settings.btEnabled = true;
-    state.settings.lastMessage = "bt enabled";
-    out.println("Bluetooth: enabled");
-    return true;
+    return settingsServiceToggleBluetooth(state, out);
 }
 
 size_t scanBluetoothDevices(Stream &out) {
-    gBluetoothDeviceCount = 0;
-    out.println("Bluetooth: scanning (BLE)");
-
-    if (!gBluetoothBleInitialized) {
-        BLEDevice::init("mp3-pedia-os");
-        gBluetoothBleInitialized = true;
-    }
-
-    BLEScan *scan = BLEDevice::getScan();
-    if (scan == nullptr) {
-        out.println("Bluetooth: scan init failed");
-        return 0;
-    }
-
-    scan->setActiveScan(true);
-    scan->setInterval(100);
-    scan->setWindow(80);
-
-    BLEScanResults results = scan->start(4, false);
-    const int found = results.getCount();
-
-    for (int i = 0; i < found && gBluetoothDeviceCount < kMaxBluetoothDevices; ++i) {
-        BLEAdvertisedDevice device = results.getDevice(i);
-        String label = "";
-
-        std::string name = device.getName();
-        if (!name.empty()) {
-            label = String(name.c_str());
-        } else {
-            std::string addr = device.getAddress().toString();
-            label = String("BLE ") + String(addr.c_str());
-        }
-
-        // Avoid duplicates in the short on-screen list.
-        bool duplicate = false;
-        for (size_t j = 0; j < gBluetoothDeviceCount; ++j) {
-            if (gBluetoothDeviceList[j] == label) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) {
-            gBluetoothDeviceList[gBluetoothDeviceCount++] = label;
-        }
-    }
-
-    scan->clearResults();
-
-    out.print("Bluetooth: found ");
-    out.println(gBluetoothDeviceCount);
+    gBluetoothDeviceCount = settingsServiceScanBluetoothDevices(
+        gBluetoothDeviceList,
+        kMaxBluetoothDevices,
+        gBluetoothBleInitialized,
+        out);
     return gBluetoothDeviceCount;
 }
 
@@ -1105,6 +2061,13 @@ void printLauncherInfo(const SystemState &state, Stream &out) {
 }
 
 bool renderLauncherScreen(SystemState &state, bool oledOnly, Stream &out) {
+    refreshLauncherSdApps(state, out);
+
+    const size_t totalCount = launcherTotalItemCount();
+    if (totalCount > 0 && state.launcher.selectedIndex >= totalCount) {
+        state.launcher.selectedIndex = static_cast<uint8_t>(totalCount - 1);
+    }
+
     if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         drawLauncherOled(state);
         xSemaphoreGive(state.spiMutex);
@@ -1126,35 +2089,37 @@ bool renderLauncherScreen(SystemState &state, bool oledOnly, Stream &out) {
         paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
         paint.DrawStringAt(8, 8, "APP LAUNCHER", &Font16, kColored);
         paint.DrawStringAt(8, 26, state.config.deviceName.c_str(), &Font12, kColored);
-        paint.DrawStringAt(172, 26, state.launcher.activeAppId.c_str(), &Font12, kColored);
+
+        const size_t pageCount = totalCount == 0 ? 1 : ((totalCount + kLauncherPageSize - 1) / kLauncherPageSize);
+        const size_t pageIndex = totalCount == 0 ? 0 : (state.launcher.selectedIndex / kLauncherPageSize);
+        String pageLabel = String("page ") + String(static_cast<unsigned>(pageIndex + 1)) + "/" + String(static_cast<unsigned>(pageCount));
+        paint.DrawStringAt(200, 26, pageLabel.c_str(), &Font12, kColored);
         paint.DrawLine(0, 38, kEinkLandscapeWidth - 1, 38, kColored);
 
-        const int cardWidth = 110;
-        const int cardHeight = 82;
+        const int cardWidth = 170;
+        const int cardHeight = 50;
         const int startX = 8;
         const int startY = 46;
         const int xGap = 8;
-        const int yGap = 12;
+        const int yGap = 8;
+        const size_t pageStart = pageIndex * kLauncherPageSize;
+        const size_t pageEnd = min(pageStart + kLauncherPageSize, totalCount);
 
-        for (size_t index = 0; index < kLauncherAppCount; ++index) {
-            const int column = static_cast<int>(index % 3);
-            const int row = static_cast<int>(index / 3);
+        for (size_t index = pageStart; index < pageEnd; ++index) {
+            const size_t localIndex = index - pageStart;
+            const int column = static_cast<int>(localIndex % 2);
+            const int row = static_cast<int>(localIndex / 2);
             const int x = startX + column * (cardWidth + xGap);
             const int y = startY + row * (cardHeight + yGap);
             const bool selected = index == state.launcher.selectedIndex;
-            drawLauncherCard(paint, x, y, cardWidth, cardHeight, kLauncherApps[index], selected);
+            String numberedTitle = String(static_cast<unsigned>(localIndex + 1));
+            numberedTitle += ".";
+            numberedTitle += launcherItemTitleAt(index);
+            drawLauncherIcon(paint, x + 8, y + 8, 20, launcherItemIdAt(index));
+            drawLauncherCard(paint, x, y, cardWidth, cardHeight, numberedTitle, selected);
         }
 
-        paint.DrawStringAt(8, 208, "1-5 open apps on CardKB", &Font12, kColored);
-        refreshLauncherSdApps(state, out);
-        if (gSdAppCount > 0) {
-            paint.DrawStringAt(8, 224, "sd apps:", &Font12, kColored);
-            int x = 76;
-            for (size_t i = 0; i < gSdAppCount && i < 4; ++i) {
-                paint.DrawStringAt(x, 224, gSdApps[i].c_str(), &Font8, kColored);
-                x += 70;
-            }
-        }
+        paint.DrawStringAt(8, 220, "1..6 open, up/down page", &Font12, kColored);
 
         // Launcher always uses full refresh for readability/stability.
         gEink.display(paint.GetImage());
@@ -1171,6 +2136,58 @@ bool renderLauncherScreen(SystemState &state, bool oledOnly, Stream &out) {
 
     markDisplayActivity();
     out.println("E-ink: launcher rendered");
+    return true;
+}
+
+bool renderFileManagerScreen(SystemState &state, bool oledOnly, Stream &out) {
+    if (state.fileManager.currentPath.isEmpty()) {
+        state.fileManager.currentPath = "/";
+    }
+
+    if (state.fileManager.viewMode == kFileManagerViewBrowse) {
+        fileManagerRefreshListing(state, out);
+        const size_t totalCount = gFileManagerEntryCount;
+        if (totalCount > 0 && state.fileManager.selectedIndex >= totalCount) {
+            state.fileManager.selectedIndex = static_cast<uint8_t>(totalCount - 1);
+        }
+
+        if (totalCount > 0) {
+            const size_t maxOffset = totalCount > kFileManagerPageSize ? totalCount - kFileManagerPageSize : size_t(0);
+            if (state.fileManager.scrollOffset > maxOffset) {
+                state.fileManager.scrollOffset = maxOffset;
+            }
+            if (state.fileManager.selectedIndex < state.fileManager.scrollOffset || state.fileManager.selectedIndex >= state.fileManager.scrollOffset + kFileManagerPageSize) {
+                state.fileManager.selectedIndex = static_cast<uint8_t>(state.fileManager.scrollOffset);
+            }
+        } else {
+            state.fileManager.selectedIndex = 0;
+            state.fileManager.scrollOffset = 0;
+        }
+    }
+
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        drawFileManagerOled(state);
+        xSemaphoreGive(state.spiMutex);
+    }
+
+    if (oledOnly) {
+        return state.oledReady;
+    }
+
+    if (!ensureEinkInitialized(state, out)) {
+        out.println("OLED: file manager rendered");
+        return state.oledReady;
+    }
+
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        drawFileManagerEink(state);
+        gEinkPartialRefreshCounter = 0;
+        ++gEinkUpdateCounter;
+        xSemaphoreGive(state.spiMutex);
+    }
+
+    markDisplayActivity();
+    out.println("E-ink: file manager rendered");
     return true;
 }
 
@@ -1249,98 +2266,145 @@ bool renderStatusScreen(SystemState &state, const String &title, const String &l
     return true;
 }
 
+bool renderDesktopScreen(SystemState &state, bool oledOnly, Stream &out) {
+    return renderStatusScreen(
+        state,
+        "PLOCHA",
+        "placeholder",
+        "sipka dolu = launcher",
+        "sipka doprava = upozorneni",
+        oledOnly,
+        out);
+}
+
+bool renderNotificationsScreen(SystemState &state, bool oledOnly, Stream &out) {
+    return renderStatusScreen(
+        state,
+        "UPOZORNENI",
+        "zatim bez notifikaci",
+        "placeholder",
+        "sipka doleva = zavrit",
+        oledOnly,
+        out);
+}
+
 bool renderActiveApp(SystemState &state, bool oledOnly, Stream &out) {
-    if (state.launcher.activeAppId.equalsIgnoreCase("launcher")) {
-        return renderLauncherScreen(state, oledOnly, out);
-    }
-
-    if (state.launcher.activeAppId.equalsIgnoreCase("settings")) {
-        return renderSettingsScreen(state, oledOnly, out);
-    }
-
-    if (state.launcher.activeAppId.equalsIgnoreCase("web-upload")) {
-        return renderWebUploadScreen(state, oledOnly, out);
-    }
-
-    return renderPlaceholderApp(state, out);
+    AppRouterRenderContext context;
+    context.renderDesktopScreen = renderDesktopScreen;
+    context.renderNotificationsScreen = renderNotificationsScreen;
+    context.renderLauncherScreen = renderLauncherScreen;
+    context.renderSettingsScreen = renderSettingsScreen;
+    context.renderFileManagerScreen = renderFileManagerScreen;
+    context.renderWebUploadScreen = renderWebUploadScreen;
+    context.renderPlaceholderApp = renderPlaceholderApp;
+    return appRouterRenderActiveApp(state, oledOnly, out, context);
 }
 
 bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
     // Decode CardKB-specific encodings before app-level routing.
     const uint8_t rawCode = static_cast<uint8_t>(key);
-    if (isCardKbLeftArrowCode(rawCode)) {
-        if (state.launcher.activeAppId.equalsIgnoreCase("settings")) {
-            if (state.settings.viewMode == kSettingsViewWifiPassword) {
-                state.settings.viewMode = kSettingsViewWifiSelectList;
-                state.settings.wifiPassword = "";
-                state.settings.lastMessage = "password canceled";
-                renderSettingsScreen(state, false, out);
-                return true;
-            }
+    AppRouterInputContext inputContext;
+    inputContext.isLeftArrowCode = isCardKbLeftArrowCode;
+    inputContext.isDownArrowCode = isCardKbDownArrowCode;
+    inputContext.isRightArrowCode = isCardKbRightArrowCode;
+    inputContext.renderDesktopScreen = renderDesktopScreen;
+    inputContext.renderLauncherScreen = renderLauncherScreen;
+    inputContext.renderSettingsScreen = renderSettingsScreen;
+    inputContext.renderNotificationsScreen = renderNotificationsScreen;
+    inputContext.stopWebUploadServer = stopWebUploadServer;
+    if (appRouterHandleDesktopDirectionalInput(state, rawCode, inputContext, out)) {
+        return true;
+    }
 
-            if (state.settings.viewMode == kSettingsViewWifiSelectList) {
-                state.settings.viewMode = kSettingsViewWifiList;
-                state.settings.lastMessage = "wifi list closed";
-                renderSettingsScreen(state, false, out);
-                return true;
-            }
-
-            if (state.settings.viewMode == kSettingsViewBluetoothSelectList) {
-                state.settings.viewMode = kSettingsViewBluetoothList;
-                state.settings.lastMessage = "device list closed";
-                renderSettingsScreen(state, false, out);
-                return true;
-            }
-
-            if (state.settings.viewMode == kSettingsViewBluetoothList || state.settings.viewMode == kSettingsViewWifiList) {
-                state.settings.viewMode = kSettingsViewHome;
-                state.settings.lastMessage = "back";
-                renderSettingsScreen(state, false, out);
-                return true;
-            }
-
-            state.launcher.activeAppId = "launcher";
-            state.settings.lastMessage = "back to launcher";
+    if (state.launcher.activeAppId.equalsIgnoreCase("file-manager") && fileManagerHandleBackInput(state, rawCode, out)) {
+        if (state.launcher.activeAppId.equalsIgnoreCase("launcher")) {
             renderLauncherScreen(state, false, out);
+        } else {
+            renderFileManagerScreen(state, false, out);
+        }
+        return true;
+    }
+
+    if (state.launcher.activeAppId.equalsIgnoreCase("file-manager")) {
+        const char fileManagerNormalizedKey = decodeCardKbKey(key);
+        if (handleFileManagerAppInput(state, key, fileManagerNormalizedKey, rawCode, out)) {
+            renderFileManagerScreen(state, false, out);
             return true;
         }
+    }
 
-        if (state.launcher.activeAppId.equalsIgnoreCase("web-upload")) {
-            stopWebUploadServer(out);
-            state.launcher.activeAppId = "launcher";
-            state.settings.lastMessage = "back to launcher";
-            renderLauncherScreen(state, false, out);
-            return true;
-        }
-
-        if (!state.launcher.activeAppId.equalsIgnoreCase("launcher")) {
-            state.launcher.activeAppId = "launcher";
-            renderLauncherScreen(state, false, out);
-            return true;
-        }
+    if (appRouterHandleBackInput(
+            state,
+            rawCode,
+            kSettingsViewHome,
+            kSettingsViewWifiList,
+            kSettingsViewWifiPassword,
+            kSettingsViewWifiSelectList,
+            kSettingsViewBluetoothList,
+            kSettingsViewBluetoothSelectList,
+            inputContext,
+            out)) {
+        return true;
     }
 
     const char normalizedKey = decodeCardKbKey(key);
 
     if (state.launcher.activeAppId.equalsIgnoreCase("launcher")) {
-        if (normalizedKey >= '1' && normalizedKey <= '5') {
-            const uint8_t appIndex = static_cast<uint8_t>(normalizedKey - '1');
-            if (appIndex < kLauncherAppCount) {
-                state.launcher.selectedIndex = appIndex;
-                state.launcher.activeAppId = kLauncherApps[appIndex].id;
-                state.settings.lastMessage = String("opened ") + kLauncherApps[appIndex].id;
-                out.print("Launcher: opening ");
-                out.println(kLauncherApps[appIndex].id);
-                renderActiveApp(state, false, out);
+        refreshLauncherSdApps(state, out);
+        const size_t totalCount = launcherTotalItemCount();
+        if (totalCount > 0) {
+            const size_t pageCount = (totalCount + kLauncherPageSize - 1) / kLauncherPageSize;
+            const size_t pageIndex = min(static_cast<size_t>(state.launcher.selectedIndex) / kLauncherPageSize, pageCount - 1);
+            const size_t pageStart = pageIndex * kLauncherPageSize;
+
+            if (isCardKbUpArrowCode(rawCode)) {
+                if (pageIndex > 0) {
+                    const size_t prevPage = pageIndex - 1;
+                    state.launcher.selectedIndex = static_cast<uint8_t>(prevPage * kLauncherPageSize);
+                    state.settings.lastMessage = String("launcher page ") + String(static_cast<unsigned>(prevPage + 1));
+                    renderLauncherScreen(state, false, out);
+                    return true;
+                }
+
+                state.launcher.activeAppId = "desktop";
+                state.settings.lastMessage = "back to desktop";
+                renderDesktopScreen(state, false, out);
                 return true;
+            }
+
+            if (isCardKbDownArrowCode(rawCode) && pageCount > 1) {
+                const size_t nextPage = (pageIndex + 1) % pageCount;
+                state.launcher.selectedIndex = static_cast<uint8_t>(nextPage * kLauncherPageSize);
+                state.settings.lastMessage = String("launcher page ") + String(static_cast<unsigned>(nextPage + 1));
+                renderLauncherScreen(state, false, out);
+                return true;
+            }
+
+            if (normalizedKey >= '1' && normalizedKey <= '6') {
+                const size_t localIndex = static_cast<size_t>(normalizedKey - '1');
+                const size_t absoluteIndex = pageStart + localIndex;
+                if (absoluteIndex < totalCount) {
+                    state.launcher.selectedIndex = static_cast<uint8_t>(absoluteIndex);
+                    const String targetId = launcherItemIdAt(absoluteIndex);
+                    const String targetTitle = launcherItemTitleAt(absoluteIndex);
+                    state.launcher.activeAppId = targetId;
+                    state.settings.lastMessage = String("opened ") + targetTitle;
+                    if (targetId.equalsIgnoreCase("file-manager")) {
+                        fileManagerResetSession(state);
+                    }
+                    out.print("Launcher: opening ");
+                    out.println(targetId);
+                    renderActiveApp(state, false, out);
+                    return true;
+                }
             }
         }
 
         if (normalizedKey >= 32 && normalizedKey <= 126) {
-            gLauncherKeyMessage = String("key: ") + normalizedKey + " (1..5 open app)";
+            gLauncherKeyMessage = String("key: ") + normalizedKey + " (1..6, up/down)";
         } else {
             char rawHex[24];
-            snprintf(rawHex, sizeof(rawHex), "key:0x%02X (1..5 open app)", static_cast<uint8_t>(key));
+            snprintf(rawHex, sizeof(rawHex), "key:0x%02X (1..6/up/down)", static_cast<uint8_t>(key));
             gLauncherKeyMessage = rawHex;
         }
         // Only update OLED for feedback on unused keys.
@@ -1349,215 +2413,42 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
     }
 
     if (state.launcher.activeAppId.equalsIgnoreCase("settings")) {
-        if (state.settings.viewMode == kSettingsViewWifiList) {
-            if (normalizedKey == '1') {
-                toggleWifiEnabled(state, out);
-                renderSettingsScreen(state, false, out);
-                return true;
-            }
+        SettingsInputContext settingsInputContext;
+        settingsInputContext.wifiListVisibleCount = kWifiListVisibleCount;
+        settingsInputContext.wifiCount = &gWifiCount;
+        settingsInputContext.wifiListScrollOffset = &gWifiListScrollOffset;
+        settingsInputContext.wifiScanInProgress = &gWifiScanInProgress;
+        settingsInputContext.wifiSsidList = gWifiSsidList;
+        settingsInputContext.bluetoothDeviceCount = &gBluetoothDeviceCount;
+        settingsInputContext.bluetoothScanInProgress = &gBluetoothScanInProgress;
+        settingsInputContext.bluetoothDeviceList = gBluetoothDeviceList;
+        settingsInputContext.czechComposeDeadKey = &gCzechComposeDeadKey;
+        settingsInputContext.isUpArrowCode = isCardKbUpArrowCode;
+        settingsInputContext.isDownArrowCode = isCardKbDownArrowCode;
+        settingsInputContext.toggleWifiEnabled = toggleWifiEnabled;
+        settingsInputContext.scanWifiNetworks = scanWifiNetworks;
+        settingsInputContext.connectSelectedWifi = connectSelectedWifi;
+        settingsInputContext.toggleBluetoothEnabled = toggleBluetoothEnabled;
+        settingsInputContext.scanBluetoothDevices = scanBluetoothDevices;
+        settingsInputContext.tryApplyPostfixCzechCompose = tryApplyPostfixCzechCompose;
+        settingsInputContext.decodeCzechComposeKey = decodeCzechComposeKey;
+        settingsInputContext.applySettingsSelection = applySettingsSelection;
+        settingsInputContext.renderSettingsScreen = renderSettingsScreen;
+        settingsInputContext.renderLauncherScreen = renderLauncherScreen;
 
-            if (normalizedKey == '2') {
-                if (!state.settings.wifiEnabled) {
-                    state.settings.lastMessage = "enable wifi first";
-                    renderSettingsScreen(state, false, out);
-                    return true;
-                }
-
-                state.settings.viewMode = kSettingsViewWifiSelectList;
-                state.settings.selectedWifiIndex = -1;
-                state.settings.selectedSsid = "";
-                state.settings.wifiPassword = "";
-                state.settings.lastMessage = "wifi scanning";
-                gWifiCount = 0;
-                gWifiScanInProgress = true;
-                renderSettingsScreen(state, false, out);
-                scanWifiNetworks(out);
-                gWifiScanInProgress = false;
-                state.settings.lastMessage = "select wifi";
-                renderSettingsScreen(state, false, out);
-                return true;
-            }
-            return false;
-        }
-
-        if (state.settings.viewMode == kSettingsViewWifiSelectList) {
-            const size_t maxOffset = gWifiCount > kWifiListVisibleCount ? gWifiCount - kWifiListVisibleCount : 0;
-
-            if (isCardKbUpArrowCode(rawCode)) {
-                if (gWifiListScrollOffset > 0) {
-                    gWifiListScrollOffset = gWifiListScrollOffset > kWifiListVisibleCount ? gWifiListScrollOffset - kWifiListVisibleCount : 0;
-                    state.settings.lastMessage = "wifi scroll up";
-                    renderSettingsScreen(state, false, out);
-                }
-                return true;
-            }
-
-            if (isCardKbDownArrowCode(rawCode)) {
-                if (gWifiListScrollOffset < maxOffset) {
-                    gWifiListScrollOffset = min(gWifiListScrollOffset + kWifiListVisibleCount, maxOffset);
-                    state.settings.lastMessage = "wifi scroll down";
-                    renderSettingsScreen(state, false, out);
-                }
-                return true;
-            }
-
-            if (normalizedKey >= '1' && normalizedKey <= '9') {
-                const uint8_t pick = static_cast<uint8_t>(normalizedKey - '1');
-                const size_t absoluteIndex = gWifiListScrollOffset + pick;
-                if (absoluteIndex < gWifiCount) {
-                    if (gWifiSsidList[absoluteIndex].isEmpty()) {
-                        state.settings.lastMessage = "hidden wifi unsupported";
-                        renderSettingsScreen(state, false, out);
-                        return true;
-                    }
-                    state.settings.selectedWifiIndex = static_cast<int8_t>(absoluteIndex);
-                    state.settings.selectedSsid = gWifiSsidList[absoluteIndex];
-                    state.settings.wifiPassword = "";
-                    state.settings.viewMode = kSettingsViewWifiPassword;
-                    state.settings.lastMessage = String("ssid ") + state.settings.selectedSsid;
-                    renderSettingsScreen(state, false, out);
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        if (state.settings.viewMode == kSettingsViewBluetoothList) {
-            if (normalizedKey == '1') {
-                toggleBluetoothEnabled(state, out);
-                renderSettingsScreen(state, false, out);
-                return true;
-            }
-
-            if (normalizedKey == '2') {
-                if (!state.settings.btEnabled) {
-                    state.settings.lastMessage = "enable bt first";
-                    renderSettingsScreen(state, false, out);
-                    return true;
-                }
-
-                state.settings.viewMode = kSettingsViewBluetoothSelectList;
-                state.settings.selectedBluetoothIndex = -1;
-                state.settings.btConnectedDeviceName = "";
-                state.settings.btConnected = false;
-                state.settings.lastMessage = "bt scanning";
-                gBluetoothDeviceCount = 0;
-                gBluetoothScanInProgress = true;
-                renderSettingsScreen(state, false, out);
-                scanBluetoothDevices(out);
-                gBluetoothScanInProgress = false;
-                state.settings.lastMessage = "select bt";
-                renderSettingsScreen(state, false, out);
-                return true;
-            }
-
-            return false;
-        }
-
-        if (state.settings.viewMode == kSettingsViewBluetoothSelectList) {
-            if (normalizedKey >= '1' && normalizedKey <= '9') {
-                const uint8_t pick = static_cast<uint8_t>(normalizedKey - '1');
-                if (pick < gBluetoothDeviceCount) {
-                    state.settings.selectedBluetoothIndex = static_cast<int8_t>(pick);
-                    state.settings.btConnectedDeviceName = gBluetoothDeviceList[pick];
-                    state.settings.btConnected = true;
-                    state.settings.lastMessage = String("bt connected ") + state.settings.btConnectedDeviceName;
-                    state.settings.viewMode = kSettingsViewBluetoothList;
-                    renderSettingsScreen(state, false, out);
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        if (state.settings.viewMode == kSettingsViewWifiPassword) {
-            // Password mode intentionally updates only OLED on typing keys.
-            if (normalizedKey == '0') {
-                gCzechComposeDeadKey = 0;
-                state.settings.viewMode = kSettingsViewWifiSelectList;
-                state.settings.wifiPassword = "";
-                state.settings.lastMessage = "password canceled";
-                renderSettingsScreen(state, false, out);
-                return true;
-            }
-
-            if (normalizedKey == '\n' || normalizedKey == '\r') {
-                gCzechComposeDeadKey = 0;
-                // Enter commits connect action and returns to settings home.
-                state.settings.lastMessage = "connecting...";
-                renderSettingsScreen(state, true, out);
-                connectSelectedWifi(state, out);
-                state.settings.viewMode = kSettingsViewHome;
-                renderSettingsScreen(state, false, out);
-                return true;
-            }
-
-            if (normalizedKey == 8 || normalizedKey == 127) {
-                gCzechComposeDeadKey = 0;
-                if (!state.settings.wifiPassword.isEmpty()) {
-                    state.settings.wifiPassword.remove(state.settings.wifiPassword.length() - 1);
-                }
-                state.settings.lastMessage = "key: backspace";
-                renderSettingsScreen(state, true, out);
-                return true;
-            }
-
-            if (normalizedKey >= 32 && normalizedKey <= 126) {
-                char composeKey = normalizedKey;
-                if (composeKey == '/') {
-                    composeKey = '^';
-                }
-
-                if (composeKey == '^' || composeKey == '\'' || composeKey == '"') {
-                    if (tryApplyPostfixCzechCompose(state.settings.wifiPassword, composeKey)) {
-                        state.settings.lastMessage = "compose postfix";
-                        renderSettingsScreen(state, true, out);
-                        return true;
-                    }
-                }
-
-                String typed;
-                decodeCzechComposeKey(composeKey, typed);
-
-                if (typed.isEmpty()) {
-                    state.settings.lastMessage = "compose...";
-                    renderSettingsScreen(state, true, out);
-                    return true;
-                }
-
-                if (state.settings.wifiPassword.length() + typed.length() < 63) {
-                    state.settings.wifiPassword += typed;
-                }
-                state.settings.lastMessage = String("key: ") + typed;
-                renderSettingsScreen(state, true, out);
-                return true;
-            }
-
-            // Keep unsupported key presses visible for debugging CardKB mapping.
-            char rawHex[20];
-            snprintf(rawHex, sizeof(rawHex), "key:0x%02X", static_cast<uint8_t>(key));
-            state.settings.lastMessage = rawHex;
-            renderSettingsScreen(state, true, out);
-            return true;
-        }
-
-        if (normalizedKey >= '1' && normalizedKey <= '5') {
-            const uint8_t optionIndex = static_cast<uint8_t>(normalizedKey - '1');
-            if (applySettingsSelection(state, optionIndex, out)) {
-                renderSettingsScreen(state, false, out);
-                return true;
-            }
-            return false;
-        }
-
-        if (normalizedKey == '0') {
-            state.launcher.activeAppId = "launcher";
-            state.settings.lastMessage = "back to launcher";
-            renderLauncherScreen(state, false, out);
-            return true;
-        }
-
-        return false;
+        return handleSettingsAppInput(
+            state,
+            key,
+            normalizedKey,
+            rawCode,
+            kSettingsViewWifiList,
+            kSettingsViewWifiPassword,
+            kSettingsViewWifiSelectList,
+            kSettingsViewBluetoothList,
+            kSettingsViewBluetoothSelectList,
+            kSettingsViewHome,
+            settingsInputContext,
+            out);
     }
 
     return false;

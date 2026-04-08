@@ -147,7 +147,7 @@ void setupApplication(SystemState &state, TaskManager &taskManager) {
         Serial.println("CardKB live logging: enabled");
     }
 
-    renderLauncherScreen(state, false, Serial);
+    renderActiveApp(state, false, Serial);
 }
 
 void processApplicationLoop(SystemState &state, TaskManager &taskManager) {
