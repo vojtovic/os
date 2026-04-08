@@ -2254,7 +2254,7 @@ bool renderDesktopScreen(SystemState &state, bool oledOnly, Stream &out) {
             R"( |  \| | \___ \  |  \| |     )",
             R"( | |\  |  ___) | | |\  |     )",
             R"( |_| \_| |____/  |_| \_|     )",
-            R"(           NoteWave           )"
+            R"(           noteWAVE           )"
         };
         const size_t artLineCount = sizeof(artLines) / sizeof(artLines[0]);
         const int lineHeight = 8;
@@ -2306,7 +2306,7 @@ bool renderDesktopScreen(SystemState &state, bool oledOnly, Stream &out) {
             R"( |  \| | \___ \  |  \| |     )",
             R"( | |\  |  ___) | | |\  |     )",
             R"( |_| \_| |____/  |_| \_|     )",
-            R"(           NoteWave           )"
+            R"(           noteWAVE           )"
         };
         const size_t artLineCount = sizeof(artLines) / sizeof(artLines[0]);
         const int lineHeight = 18;
