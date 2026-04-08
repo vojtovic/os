@@ -1,5 +1,11 @@
 #include "AppRouter.h"
 
+namespace {
+constexpr uint8_t kNotificationsHidden = 0;
+constexpr uint8_t kNotificationsStrip = 1;
+constexpr uint8_t kNotificationsExpanded = 2;
+}  // namespace
+
 bool appRouterRenderActiveApp(
     SystemState &state,
     bool oledOnly,
@@ -49,7 +55,15 @@ bool appRouterHandleBackInput(
 
     if (state.launcher.activeAppId.equalsIgnoreCase("notifications")) {
         state.launcher.activeAppId = "desktop";
-        state.settings.lastMessage = "upozorneni zavreno";
+        state.notifications.viewMode = kNotificationsStrip;
+        state.settings.lastMessage = "upozorneni sbaleno";
+        context.renderDesktopScreen(state, false, out);
+        return true;
+    }
+
+    if (state.launcher.activeAppId.equalsIgnoreCase("desktop") && state.notifications.viewMode == kNotificationsStrip) {
+        state.notifications.viewMode = kNotificationsHidden;
+        state.settings.lastMessage = "lista zavrena";
         context.renderDesktopScreen(state, false, out);
         return true;
     }
@@ -117,6 +131,7 @@ bool appRouterHandleDesktopDirectionalInput(
     }
 
     if (context.isDownArrowCode(rawCode)) {
+        state.notifications.viewMode = kNotificationsHidden;
         state.launcher.activeAppId = "launcher";
         state.settings.lastMessage = "launcher";
         context.renderLauncherScreen(state, false, out);
@@ -124,8 +139,16 @@ bool appRouterHandleDesktopDirectionalInput(
     }
 
     if (context.isRightArrowCode(rawCode)) {
+        if (state.notifications.viewMode == kNotificationsHidden) {
+            state.notifications.viewMode = kNotificationsStrip;
+            state.settings.lastMessage = "lista upozorneni";
+            context.renderDesktopScreen(state, false, out);
+            return true;
+        }
+
+        state.notifications.viewMode = kNotificationsExpanded;
         state.launcher.activeAppId = "notifications";
-        state.settings.lastMessage = "upozorneni";
+        state.settings.lastMessage = "upozorneni full";
         context.renderNotificationsScreen(state, false, out);
         return true;
     }

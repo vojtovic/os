@@ -33,6 +33,8 @@ Use this file as the shared context between agents in this workspace.
 - File Manager now resets to a clean browse session on launch so stale submenu state does not block input after open.
 - SD apps manifest loader now checks `SD.exists("/apps/apps.txt")` before `SD.open` to avoid noisy VFS `open()` errors when the file is missing.
 - File Manager now forces a redraw after handled key input so actions (e.g., `1` select/menu open) are immediately visible.
+- Launcher arrow handling now runs before numeric shortcuts, and CardKB arrow variants are excluded from numeric normalization to prevent arrow->digit collisions.
+- Notifications UX changed to two-step flow: first right-arrow from desktop shows a strip, second right-arrow expands to full notifications screen on e-ink; left-arrow collapses/close in reverse.
 - Added a first web upload app scaffold with a `WebServer`-based upload handler and status screen.
 - Web upload starts only when WiFi STA is connected; upload target prefers SD, then LittleFS.
 - Launcher shortcut `2` now opens the web upload app.
@@ -84,6 +86,10 @@ Use this file as the shared context between agents in this workspace.
 - Verify: done, evidence: `platformio run` SUCCESS (2026-04-08) after manifest-check patch, next stage: optional on-device log sanity check.
 - Build: done, evidence: patched file-manager input path to re-render screen on handled keys, next stage: compile verification.
 - Verify: done, evidence: `platformio run` SUCCESS (2026-04-08) after file-manager redraw patch, next stage: on-device keypress smoke test.
+- Build: done, evidence: patched launcher input path and key normalization to avoid arrow keys opening numbered apps, next stage: compile verification.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-08) after launcher arrow/digit fix, next stage: on-device launcher navigation test.
+- Build: done, evidence: added notifications drawer state plus desktop strip rendering and two-stage router transitions, next stage: compile verification.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-08) after notifications strip/fullscreen patch, next stage: on-device UX check.
 - Strategy: done, evidence: analyzed Settings/WiFi state machine and rendering in DisplayManager, next stage: implement WiFi manager split.
 - Ideas: done, evidence: selected low-risk approach with new WiFi manager actions and separate SSID select view, next stage: patch code.
 - Build: done, evidence: patched SystemState + DisplayManager for toggle/connect/status/SSID behavior, next stage: compile verification.

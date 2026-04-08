@@ -49,11 +49,16 @@ struct FileManagerState {
     uint8_t menuIndex = 0;
 };
 
+struct NotificationsState {
+    uint8_t viewMode = 0;  // 0 hidden, 1 strip, 2 expanded
+};
+
 struct SystemState {
     AppConfig config;
     LauncherState launcher;
     SettingsState settings;
     FileManagerState fileManager;
+    NotificationsState notifications;
     bool littleFsReady = false;
     bool sdReady = false;
     bool i2cReady = false;

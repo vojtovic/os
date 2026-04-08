@@ -45,6 +45,7 @@ constexpr int kEinkNativeHeight = EPD_HEIGHT;
 constexpr int kEinkLandscapeWidth = EPD_HEIGHT;
 constexpr int kEinkLandscapeHeight = EPD_WIDTH;
 constexpr uint32_t kEinkIdleTimeoutMs = 60000;
+constexpr uint8_t kEinkFullRefreshInterval = 7;
 
 U8G2_SH1106_128X64_NONAME_F_4W_HW_SPI gOled(
     U8G2_R0,
@@ -104,6 +105,7 @@ char gCzechComposeDeadKey = 0;
 
 bool ensureEinkInitialized(SystemState &state, Stream &out);
 void markDisplayActivity();
+void refreshEinkWithCadence(bool forceFull = false);
 bool tryWakeEinkPanel(SystemState &state, Stream &out);
 void forceOledSleepOff(SystemState &state);
 void forceOledWakeOn(SystemState &state);
@@ -128,7 +130,7 @@ String formatWifiDisplayLabel(size_t index) {
 }
 
 bool isCardKbUpArrowCode(uint8_t code) {
-    return code == 0x95 || code == 0xB5;
+    return code == 0x93 || code == 0x95 || code == 0xB3 || code == 0xB5;
 }
 
 bool isCardKbDownArrowCode(uint8_t code) {
@@ -136,7 +138,7 @@ bool isCardKbDownArrowCode(uint8_t code) {
 }
 
 bool isCardKbRightArrowCode(uint8_t code) {
-    return code == 0x97 || code == 0xB7;
+    return code == 0x97 || code == 0x98 || code == 0xB7 || code == 0xB8;
 }
 
 constexpr uint8_t kFileManagerViewBrowse = 0;
@@ -711,11 +713,7 @@ void drawFileManagerEink(const SystemState &state) {
     }
 
     gEink.display(paint.GetImage());
-    vTaskDelay(pdMS_TO_TICKS(1));
-    gEink.lut_GC();
-    vTaskDelay(pdMS_TO_TICKS(1));
-    gEink.refresh();
-    vTaskDelay(pdMS_TO_TICKS(5));
+    refreshEinkWithCadence(false);
 }
 
 void fileManagerEnterDirectory(SystemState &state, const String &path, Stream &out) {
@@ -1650,11 +1648,7 @@ void drawSettingsEink(SystemState &state) {
     }
 
     gEink.display(paint.GetImage());
-    vTaskDelay(pdMS_TO_TICKS(1));
-    gEink.lut_GC();
-    vTaskDelay(pdMS_TO_TICKS(1));
-    gEink.refresh();
-    vTaskDelay(pdMS_TO_TICKS(5));
+    refreshEinkWithCadence(false);
 }
 
 
@@ -1710,6 +1704,11 @@ char normalizeInputKey(char key) {
     }
 
     const uint8_t code = static_cast<uint8_t>(key);
+    // Arrow scan codes can overlap with numeric high-bit ranges.
+    if (isCardKbLeftArrowCode(code) || isCardKbUpArrowCode(code) || isCardKbDownArrowCode(code) || isCardKbRightArrowCode(code)) {
+        return key;
+    }
+
     if (code >= 0xB0 && code <= 0xB9) {
         return static_cast<char>('0' + (code - 0xB0));
     }
@@ -1854,7 +1853,7 @@ bool tryApplyPostfixCzechCompose(String &buffer, char deadKey) {
 
 bool isCardKbLeftArrowCode(uint8_t code) {
     // CardKB left-arrow observed variants.
-    return code == 0x94 || code == 0xB4;
+    return code == 0x92 || code == 0x94 || code == 0xB2 || code == 0xB4;
 }
 
 char decodeCardKbKey(char rawKey) {
@@ -1942,13 +1941,7 @@ bool renderPlaceholderApp(SystemState &state, Stream &out) {
         paint.DrawStringAt(10, 72, "This app is not implemented yet", &Font12, kColored);
         paint.DrawStringAt(10, 92, "Try: launcher open settings", &Font12, kColored);
         gEink.display(paint.GetImage());
-        vTaskDelay(pdMS_TO_TICKS(1));
-        gEink.lut_GC();
-        vTaskDelay(pdMS_TO_TICKS(1));
-        gEink.refresh();
-        vTaskDelay(pdMS_TO_TICKS(5));
-        gEinkPartialRefreshCounter = 0;
-        ++gEinkUpdateCounter;
+        refreshEinkWithCadence(false);
     }
 
     out.println("App placeholder rendered");
@@ -2121,16 +2114,8 @@ bool renderLauncherScreen(SystemState &state, bool oledOnly, Stream &out) {
 
         paint.DrawStringAt(8, 220, "1..6 open, up/down page", &Font12, kColored);
 
-        // Launcher always uses full refresh for readability/stability.
         gEink.display(paint.GetImage());
-        vTaskDelay(pdMS_TO_TICKS(1));
-        gEink.lut_GC();
-        vTaskDelay(pdMS_TO_TICKS(1));
-        gEink.refresh();
-        vTaskDelay(pdMS_TO_TICKS(5));
-        gEinkPartialRefreshCounter = 0;
-
-        ++gEinkUpdateCounter;
+        refreshEinkWithCadence(false);
         xSemaphoreGive(state.spiMutex);
     }
 
@@ -2181,8 +2166,6 @@ bool renderFileManagerScreen(SystemState &state, bool oledOnly, Stream &out) {
 
     if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
         drawFileManagerEink(state);
-        gEinkPartialRefreshCounter = 0;
-        ++gEinkUpdateCounter;
         xSemaphoreGive(state.spiMutex);
     }
 
@@ -2211,11 +2194,8 @@ bool renderSettingsScreen(SystemState &state, bool oledOnly, Stream &out) {
         return state.oledReady;
     }
 
-    // Settings view transitions use full refresh for clean state changes.
     if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
         drawSettingsEink(state);
-        gEinkPartialRefreshCounter = 0;
-        ++gEinkUpdateCounter;
         xSemaphoreGive(state.spiMutex);
     }
     markDisplayActivity();
@@ -2254,11 +2234,7 @@ bool renderStatusScreen(SystemState &state, const String &title, const String &l
         paint.DrawStringAt(8, 70, line2.c_str(), &Font12, kColored);
         paint.DrawStringAt(8, 90, line3.c_str(), &Font12, kColored);
         gEink.display(paint.GetImage());
-        vTaskDelay(pdMS_TO_TICKS(1));
-        gEink.lut_GC();
-        vTaskDelay(pdMS_TO_TICKS(1));
-        gEink.refresh();
-        vTaskDelay(pdMS_TO_TICKS(5));
+        refreshEinkWithCadence(false);
         xSemaphoreGive(state.spiMutex);
     }
 
@@ -2267,14 +2243,83 @@ bool renderStatusScreen(SystemState &state, const String &title, const String &l
 }
 
 bool renderDesktopScreen(SystemState &state, bool oledOnly, Stream &out) {
-    return renderStatusScreen(
-        state,
-        "PLOCHA",
-        "placeholder",
-        "sipka dolu = launcher",
-        "sipka doprava = upozorneni",
-        oledOnly,
-        out);
+    if (state.oledReady && state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        const bool notifStripVisible = state.notifications.viewMode == 1;
+        const int panelWidth = 42;  // ~1/3 of 128px OLED width.
+        const int contentWidth = notifStripVisible ? (128 - panelWidth - 2) : 128;
+        gOled.clearBuffer();
+        gOled.setFont(u8g2_font_4x6_tf);
+        gOled.drawStr(0, 7, "PLOCHA");
+        gOled.drawStr(0, 15, "   /\\_/\\");
+        gOled.drawStr(0, 23, "  ( o.o )");
+        if (contentWidth >= 96) {
+            gOled.drawStr(0, 31, "   > ^ <   mp3-pedia");
+            gOled.drawStr(0, 47, "dolu=launcher");
+            gOled.drawStr(0, 55, "doprava=notif");
+        } else {
+            gOled.drawStr(0, 31, "   > ^ <");
+            gOled.drawStr(0, 47, "dolu=launch");
+            gOled.drawStr(0, 55, "prava=notif");
+        }
+
+        if (notifStripVisible) {
+            const int panelX = 128 - panelWidth;
+            gOled.drawFrame(panelX, 0, panelWidth, 64);
+            gOled.drawLine(panelX, 0, panelX, 63);
+            gOled.setFont(u8g2_font_4x6_tf);
+            gOled.drawStr(panelX + 2, 8, "NOTIF");
+            gOled.drawStr(panelX + 2, 20, "doprava");
+            gOled.drawStr(panelX + 2, 28, "= full");
+            gOled.drawStr(panelX + 2, 40, "doleva");
+            gOled.drawStr(panelX + 2, 48, "= zavrit");
+        }
+
+        gOled.sendBuffer();
+        xSemaphoreGive(state.spiMutex);
+    }
+
+    if (oledOnly) {
+        return state.oledReady;
+    }
+
+    if (!ensureEinkInitialized(state, out)) {
+        return state.oledReady;
+    }
+
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        const bool notifStripVisible = state.notifications.viewMode == 1;
+        const int panelWidth = kEinkLandscapeWidth / 3;
+        const int panelX = kEinkLandscapeWidth - panelWidth;
+        Paint paint(gEinkBuffer, kEinkNativeWidth, kEinkNativeHeight);
+        prepareLandscapePaint(paint);
+        paint.Clear(kUncolored);
+        paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
+        paint.DrawStringAt(8, 10, "PLOCHA", &Font16, kColored);
+        paint.DrawLine(0, 32, kEinkLandscapeWidth - 1, 32, kColored);
+        paint.DrawStringAt(8, 52, "   /\\_/\\", &Font12, kColored);
+        paint.DrawStringAt(8, 70, "  ( o.o )", &Font12, kColored);
+        if (!notifStripVisible) {
+            paint.DrawStringAt(8, 88, "   > ^ <    mp3-pedia", &Font12, kColored);
+            paint.DrawStringAt(8, 110, "sipka dolu = launcher", &Font12, kColored);
+            paint.DrawStringAt(8, 128, "sipka doprava = upozorneni", &Font12, kColored);
+        } else {
+            paint.DrawStringAt(8, 88, "   > ^ <", &Font12, kColored);
+            paint.DrawStringAt(8, 110, "sipka dolu = launcher", &Font12, kColored);
+            paint.DrawStringAt(8, 128, "sipka prava = notif", &Font12, kColored);
+            paint.DrawRectangle(panelX, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
+            paint.DrawLine(panelX, 0, panelX, kEinkLandscapeHeight - 1, kColored);
+            paint.DrawStringAt(panelX + 8, 18, "UPOZORNENI", &Font12, kColored);
+            paint.DrawStringAt(panelX + 8, 40, "doprava=full", &Font12, kColored);
+            paint.DrawStringAt(panelX + 8, 58, "doleva=zavrit", &Font12, kColored);
+        }
+
+        gEink.display(paint.GetImage());
+        refreshEinkWithCadence(false);
+        xSemaphoreGive(state.spiMutex);
+    }
+
+    noteDisplayActivity();
+    return true;
 }
 
 bool renderNotificationsScreen(SystemState &state, bool oledOnly, Stream &out) {
@@ -2282,8 +2327,8 @@ bool renderNotificationsScreen(SystemState &state, bool oledOnly, Stream &out) {
         state,
         "UPOZORNENI",
         "zatim bez notifikaci",
-        "placeholder",
-        "sipka doleva = zavrit",
+        "full ekran e-ink",
+        "sipka doleva = sbalit listu",
         oledOnly,
         out);
 }
@@ -2356,6 +2401,21 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             const size_t pageCount = (totalCount + kLauncherPageSize - 1) / kLauncherPageSize;
             const size_t pageIndex = min(static_cast<size_t>(state.launcher.selectedIndex) / kLauncherPageSize, pageCount - 1);
             const size_t pageStart = pageIndex * kLauncherPageSize;
+
+            if (isCardKbLeftArrowCode(rawCode)) {
+                state.launcher.activeAppId = "desktop";
+                state.settings.lastMessage = "back to desktop";
+                renderDesktopScreen(state, false, out);
+                return true;
+            }
+
+            if (isCardKbRightArrowCode(rawCode) && pageCount > 1) {
+                const size_t nextPage = (pageIndex + 1) % pageCount;
+                state.launcher.selectedIndex = static_cast<uint8_t>(nextPage * kLauncherPageSize);
+                state.settings.lastMessage = String("launcher page ") + String(static_cast<unsigned>(nextPage + 1));
+                renderLauncherScreen(state, false, out);
+                return true;
+            }
 
             if (isCardKbUpArrowCode(rawCode)) {
                 if (pageIndex > 0) {
@@ -2481,24 +2541,44 @@ bool renderEinkMessage(SystemState &state, const String &rawText, bool forceFull
         y += 18;
     }
 
-    // Policy: after 9 DU refreshes, the next update is forced to full GC.
-    const bool partialThresholdReached = gEinkPartialRefreshCounter >= 9;
-    const bool doFull = forceFullRefresh || partialThresholdReached;
-
     gEink.display(paint.GetImage());
+    const bool partialThresholdReached = gEinkPartialRefreshCounter >= (kEinkFullRefreshInterval - 1);
+    const bool doFull = forceFullRefresh || partialThresholdReached;
+    refreshEinkWithCadence(forceFullRefresh);
+
+    markDisplayActivity();
+    out.println(doFull ? "E-ink: full refresh" : "E-ink: fast refresh");
+    return true;
+}
+
+namespace {
+void refreshEinkWithCadence(bool forceFull) {
+    const bool partialThresholdReached = gEinkPartialRefreshCounter >= (kEinkFullRefreshInterval - 1);
+    const bool doFull = forceFull || partialThresholdReached;
+
+    vTaskDelay(pdMS_TO_TICKS(1));
     if (doFull) {
+        gEink.lut_GC();
         gEinkPartialRefreshCounter = 0;
     } else {
         gEink.lut_DU();
         ++gEinkPartialRefreshCounter;
     }
+    vTaskDelay(pdMS_TO_TICKS(1));
     gEink.refresh();
-
+    vTaskDelay(pdMS_TO_TICKS(5));
     ++gEinkUpdateCounter;
-    markDisplayActivity();
-    out.println(doFull ? "E-ink: full refresh" : "E-ink: fast refresh");
-    return true;
+
+    Serial.print("E-ink cadence: ");
+    Serial.print(doFull ? "FULL" : "DU");
+    Serial.print(" update=");
+    Serial.print(gEinkUpdateCounter);
+    Serial.print(" duCount=");
+    Serial.print(gEinkPartialRefreshCounter);
+    Serial.print("/");
+    Serial.println(kEinkFullRefreshInterval - 1);
 }
+}  // namespace
 
 bool wakeDisplaysOnInput(SystemState &state, Stream &out) {
     bool wokeAny = false;

@@ -18,16 +18,17 @@ String describeCardKbKey(char ch) {
     if (ch == 8) {
         return "BACKSPACE";
     }
-    if (static_cast<uint8_t>(ch) == 0x94 || static_cast<uint8_t>(ch) == 0xB4) {
+    const uint8_t raw = static_cast<uint8_t>(ch);
+    if (raw == 0x92 || raw == 0x94 || raw == 0xB2 || raw == 0xB4) {
         return "LEFT";
     }
-    if (static_cast<uint8_t>(ch) == 0x95 || static_cast<uint8_t>(ch) == 0xB5) {
+    if (raw == 0x93 || raw == 0x95 || raw == 0xB3 || raw == 0xB5) {
         return "UP";
     }
-    if (static_cast<uint8_t>(ch) == 0x96 || static_cast<uint8_t>(ch) == 0xB6) {
+    if (raw == 0x96 || raw == 0xB6) {
         return "DOWN";
     }
-    if (static_cast<uint8_t>(ch) == 0x97 || static_cast<uint8_t>(ch) == 0xB7) {
+    if (raw == 0x97 || raw == 0x98 || raw == 0xB7 || raw == 0xB8) {
         return "RIGHT";
     }
     if (ch >= 32 && ch <= 126) {
