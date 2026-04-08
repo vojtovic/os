@@ -2247,19 +2247,27 @@ bool renderDesktopScreen(SystemState &state, bool oledOnly, Stream &out) {
         const bool notifStripVisible = state.notifications.viewMode == 1;
         const int panelWidth = 42;  // ~1/3 of 128px OLED width.
         const int contentWidth = notifStripVisible ? (128 - panelWidth - 2) : 128;
+        const int contentStartX = 0;
+        const char *artLines[] = {
+            R"(  _   _   ____    _   _      )",
+            R"( | \ | | / ___|  | \ | |     )",
+            R"( |  \| | \___ \  |  \| |     )",
+            R"( | |\  |  ___) | | |\  |     )",
+            R"( |_| \_| |____/  |_| \_|     )",
+            R"(           NoteWave           )"
+        };
+        const size_t artLineCount = sizeof(artLines) / sizeof(artLines[0]);
+        const int lineHeight = 8;
+        const int artHeight = static_cast<int>(artLineCount) * lineHeight;
+        const int artStartY = max(10, (64 - artHeight) / 2 + 6);
+
         gOled.clearBuffer();
         gOled.setFont(u8g2_font_4x6_tf);
-        gOled.drawStr(0, 7, "PLOCHA");
-        gOled.drawStr(0, 15, "   /\\_/\\");
-        gOled.drawStr(0, 23, "  ( o.o )");
-        if (contentWidth >= 96) {
-            gOled.drawStr(0, 31, "   > ^ <   mp3-pedia");
-            gOled.drawStr(0, 47, "dolu=launcher");
-            gOled.drawStr(0, 55, "doprava=notif");
-        } else {
-            gOled.drawStr(0, 31, "   > ^ <");
-            gOled.drawStr(0, 47, "dolu=launch");
-            gOled.drawStr(0, 55, "prava=notif");
+        for (size_t i = 0; i < artLineCount; ++i) {
+            const int lineWidth = static_cast<int>(String(artLines[i]).length()) * 4;
+            const int x = contentStartX + max(0, (contentWidth - lineWidth) / 2);
+            const int y = artStartY + static_cast<int>(i) * lineHeight;
+            gOled.drawStr(x, y, artLines[i]);
         }
 
         if (notifStripVisible) {
@@ -2290,22 +2298,36 @@ bool renderDesktopScreen(SystemState &state, bool oledOnly, Stream &out) {
         const bool notifStripVisible = state.notifications.viewMode == 1;
         const int panelWidth = kEinkLandscapeWidth / 3;
         const int panelX = kEinkLandscapeWidth - panelWidth;
+        const int contentStartX = 0;
+        const int contentWidth = notifStripVisible ? panelX : kEinkLandscapeWidth;
+        const char *artLines[] = {
+            R"(  _   _   ____    _   _      )",
+            R"( | \ | | / ___|  | \ | |     )",
+            R"( |  \| | \___ \  |  \| |     )",
+            R"( | |\  |  ___) | | |\  |     )",
+            R"( |_| \_| |____/  |_| \_|     )",
+            R"(           NoteWave           )"
+        };
+        const size_t artLineCount = sizeof(artLines) / sizeof(artLines[0]);
+        const int lineHeight = 18;
+        const int artHeight = static_cast<int>(artLineCount) * lineHeight;
+        const int artStartY = max(56, (kEinkLandscapeHeight - artHeight) / 2);
+
         Paint paint(gEinkBuffer, kEinkNativeWidth, kEinkNativeHeight);
         prepareLandscapePaint(paint);
         paint.Clear(kUncolored);
         paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
-        paint.DrawStringAt(8, 10, "PLOCHA", &Font16, kColored);
+        paint.DrawStringAt(8, 10, "NOTEWAVE", &Font16, kColored);
         paint.DrawLine(0, 32, kEinkLandscapeWidth - 1, 32, kColored);
-        paint.DrawStringAt(8, 52, "   /\\_/\\", &Font12, kColored);
-        paint.DrawStringAt(8, 70, "  ( o.o )", &Font12, kColored);
-        if (!notifStripVisible) {
-            paint.DrawStringAt(8, 88, "   > ^ <    mp3-pedia", &Font12, kColored);
-            paint.DrawStringAt(8, 110, "sipka dolu = launcher", &Font12, kColored);
-            paint.DrawStringAt(8, 128, "sipka doprava = upozorneni", &Font12, kColored);
-        } else {
-            paint.DrawStringAt(8, 88, "   > ^ <", &Font12, kColored);
-            paint.DrawStringAt(8, 110, "sipka dolu = launcher", &Font12, kColored);
-            paint.DrawStringAt(8, 128, "sipka prava = notif", &Font12, kColored);
+
+        for (size_t i = 0; i < artLineCount; ++i) {
+            const int lineWidth = static_cast<int>(String(artLines[i]).length()) * 7;
+            const int x = contentStartX + max(0, (contentWidth - lineWidth) / 2);
+            const int y = artStartY + static_cast<int>(i) * lineHeight;
+            paint.DrawStringAt(x, y, artLines[i], &Font12, kColored);
+        }
+
+        if (notifStripVisible) {
             paint.DrawRectangle(panelX, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
             paint.DrawLine(panelX, 0, panelX, kEinkLandscapeHeight - 1, kColored);
             paint.DrawStringAt(panelX + 8, 18, "UPOZORNENI", &Font12, kColored);

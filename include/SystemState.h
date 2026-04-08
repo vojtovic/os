@@ -5,7 +5,7 @@
 #include <freertos/semphr.h>
 
 struct AppConfig {
-    String deviceName = "os";
+    String deviceName = "NoteWave";
     bool sdEnabled = true;
     uint32_t sdProbeSpeed = 4000000;
 };

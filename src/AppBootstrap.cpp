@@ -94,7 +94,7 @@ void setupApplication(SystemState &state, TaskManager &taskManager) {
     Serial.begin(115200);
     delay(500);
 
-    Serial.println("os project ready");
+    Serial.println("NoteWave project ready");
     printPrompt();
 
     // Core safety: create mutexes before any hardware access or task starts.
