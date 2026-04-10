@@ -3,7 +3,53 @@
 Use this file as the shared context between agents in this workspace.
 
 ## Current Objective
-- Next focus: implement a built-in File Manager app for SD card files and folders, with launcher integration and CardKB-driven action menus.
+- Next focus: design the music-player app path with SD-backed content so the firmware stays small and the launcher can expose it cleanly.
+
+## Execution Plan (Direct HTTPS Web Explorer)
+1. Strategy: replace HTTP-only web upload serving with direct HTTPS on ESP so no always-on external proxy is required.
+2. Ideas: use an ESP32-S3 compatible HTTPS server library with self-signed certificate generation and keep existing file-explorer endpoint behavior stable.
+3. Build: migrate `WebUploadManager` server lifecycle and handlers to HTTPS callbacks and keep shell commands/start-stop flow unchanged.
+4. Verify: run `platformio run` and ensure firmware links with HTTPS server stack.
+5. Review: check for regressions in `web-upload status|start|stop`, WiFi gating, and SD/LittleFS file operations.
+6. Optimize: keep fallback behavior to plain HTTP where HTTPS startup fails, so recovery remains deterministic.
+7. Explain: document self-signed certificate behavior and browser warning expectation.
+
+## Stage Status (Direct HTTPS Web Explorer)
+- Strategy: done, evidence: user requested direct HTTPS without a permanently hosted proxy, next stage: ideas.
+- Ideas: done, evidence: selected `jackjansen/esp32_idf5_https_server` as the IDF5-compatible path after rejecting incompatible `esp32_https_server`, next stage: build.
+- Build: done, evidence: migrated `WebUploadManager.cpp` to HTTPS server API with endpoint parity for list/upload/mkdir/delete/rename/download, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-09) with final image generation after dependency conflict resolution in `platformio.ini`, next stage: review.
+- Review: done, evidence: existing web-upload lifecycle and shell control surface were preserved while adding HTTPS server flow, next stage: optimize.
+- Optimize: done, evidence: retained HTTP fallback server path when HTTPS init is unavailable to keep field recovery straightforward, next stage: explain.
+- Explain: done, evidence: direct HTTPS is now firmware-native and requires browser acceptance of a self-signed certificate warning on first access, next stage: on-device smoke test.
+
+## Execution Plan (WiFi Password Persistence)
+1. Strategy: persist WiFi credentials in existing config storage to keep settings flow unchanged and avoid new subsystems.
+2. Ideas: save credentials only after successful connect and prefill password when user re-selects the same SSID.
+3. Build: extend `AppConfig` + `ConfigStore` keys and patch settings connectivity/input modules.
+4. Verify: run `platformio run` after patch set.
+5. Review: confirm no regressions in WiFi manager navigation and avoid plaintext password printing in shell output.
+
+## Stage Status (WiFi Password Persistence)
+- Strategy: done, evidence: user explicitly requested focus on remembering WiFi passwords, next stage: ideas.
+- Ideas: done, evidence: selected minimal-risk persistence in `config.ini` with post-connect save + same-SSID prefill, next stage: build.
+- Build: done, evidence: patched `SystemState`, `ConfigStore`, `SettingsConnectivityService`, `SettingsInputManager`, and default `data/config.ini`, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-10) after WiFi persistence patch set, next stage: review.
+- Review: done, evidence: settings navigation remains unchanged and `printConfig` now masks password value instead of printing plaintext, next stage: on-device validation.
+
+## Execution Plan (Web File Explorer over ESP)
+1. Strategy: enable full SD/LittleFS file management through the existing web-upload server so no external SD card reader is needed.
+2. Ideas: replace the simple upload page with Explorer-style layout and JSON API endpoints for list/upload/mkdir/delete/rename/download.
+3. Build: implement path-safe filesystem helpers in `WebUploadManager` and serve a single-page file explorer UI with toolbar + file table interactions.
+4. Verify: run `platformio run` after edits and confirm the server still starts only with active WiFi.
+5. Review: ensure existing shell commands (`web-upload status|start|stop`) and launcher integration stay intact.
+
+## Stage Status (Web File Explorer over ESP)
+- Strategy: done, evidence: user has no SD reader and requested direct SD management from ESP over web, next stage: ideas.
+- Ideas: done, evidence: selected Explorer-like single-page UI with API endpoints (`/api/list`, `/api/upload`, `/api/mkdir`, `/api/delete`, `/api/rename`, `/api/download`), next stage: build.
+- Build: done, evidence: replaced simple upload page in `WebUploadManager.cpp` with path-safe filesystem operations and interactive file table UI, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-09) after fixing parser artifacts from large patch, next stage: review.
+- Review: done, evidence: web-upload start/stop/status lifecycle remains intact and still depends on active WiFi connection, next stage: explain.
 
 ## Constraints
 - Keep boot stable.
@@ -50,10 +96,38 @@ Use this file as the shared context between agents in this workspace.
 - Verify WiFi manager UX feels clear on OLED text density (SSID length may overflow on long names).
 
 ## Next Actions
-- Implement File Manager browse/action flow.
-- Validate file-manager back navigation on-device after wake.
-- Validate with `platformio run` after edits.
+- Resume from the current UI state and check the desktop wordmark on-device.
+- Keep the current e-ink cadence at every 7th full refresh.
+- Validate with `platformio run` after any follow-up edits.
 - Keep SD playback MVP on the backlog until requested.
+- Clarify the SD app model for music: code remains in firmware, while tracks, playlist metadata, and app config can live on SD.
+- Add a minimal launcher entry and app screen for music playback only after the SD data layout is agreed.
+
+## Execution Plan (Music Player App on SD)
+1. Strategy: keep the launcher/app routing built-in and move only music content and configuration to SD, because ESP32-S3 cannot execute native app code from SD card.
+2. Ideas: add a dedicated music-player screen that reads playlist/config files from a fixed SD folder and shows track/status controls without broad menu rewrites.
+3. Build: wire a new music-player app ID into the launcher/router, add SD file loading helpers for playlist/config data, and keep the UI modular so audio hardware work can follow later.
+4. Verify: run `platformio run` after the patch set.
+5. Review: confirm the launcher still opens existing apps, SD manifest loading stays stable, and the new app does not disturb boot or shell behavior.
+
+## Stage Status (Music Player App on SD)
+- Strategy: done, evidence: user wants the music player separated from the OS menu flow and stored on SD as much as the platform allows, next stage: build.
+- Ideas: done, evidence: selected SD-backed library model (`/music-player` + optional `playlist.txt`) with built-in renderer/input route to keep boot stable, next stage: build.
+- Build: done, evidence: added `music-player` launcher app + `sdapp:music-player` route, SD library scanner, OLED/e-ink screen, and input handling in app flow, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-09) after crash-recovery patch set, next stage: review.
+- Review: done, evidence: shell launcher IDs/help updated with `music-player`, back navigation unchanged via left-arrow router path, next stage: optimize.
+- Optimize: done, evidence: kept implementation localized to existing modules without introducing new boot-time hardware init paths, next stage: explain.
+
+## Continuation Notes
+- Branding: device/project name is now `NoteWave`.
+- Desktop: centered ASCII wordmark currently uses `noteWAVE` and must stay fully visible on both OLED and e-ink.
+- Notifications: desktop right-arrow opens a right-side strip first, second right-arrow opens full notifications, left-arrow collapses/closes.
+- File Manager: app opens cleanly, redraws after handled input, and left-arrow/back must not fall through to numeric shortcuts.
+- Input: CardKB arrow scan codes are guarded before digit normalization; launcher arrows must never open apps as numbers.
+- E-ink: refresh cadence helper is centralized; every 7th refresh is full GC to reduce ghosting.
+- Serial debug: every CardKB press is logged with human-readable key name plus raw hex, and e-ink cadence logs DU/FULL updates.
+- Shell: existing web-upload and launcher refresh commands remain available for quick checks.
+- Validation: always run `platformio run` after edits; use on-device serial monitor if behavior is unclear.
 
 ## Execution Plan (File Manager)
 1. Strategy: add one built-in `file-manager` app that owns browse, action menu, and paste/create-folder flows for SD card content.
@@ -137,5 +211,94 @@ Use this file as the shared context between agents in this workspace.
 - Review: done, evidence: launcher now supports `up/down` page navigation and desktop return policy from first launcher page while preserving `1..6` open behavior, next stage: optional icon polish.
 
 ## Last Update
-- Date: 2026-04-07
+- Date: 2026-04-09
 - Updated by agent: Team Orchestrator
+
+## Execution Plan (SD Settings Submenu)
+1. Strategy: turn the two SD-related settings into a single SD manager entry from settings home.
+2. Ideas: keep WiFi/Bluetooth patterns intact, add one SD view with toggle + speed actions, and use left-arrow back instead of numeric `0`.
+3. Build: update settings labels, view constants, routing, and input handling in the existing settings modules.
+4. Verify: run `platformio run` after the patch set.
+5. Review: confirm settings home still fits on OLED/e-ink and that `0` no longer acts as a settings back key.
+
+## Execution Plan (E-ink Block ASCII Support)
+1. Strategy: keep OLED path unchanged and patch only e-ink desktop art path.
+2. Ideas: use smallest e-ink font (`Font8`) and add renderer support for UTF-8 block symbols used by the existing ASCII art.
+3. Build: extend `Paint::DrawStringAtUtf8` for block symbols (`▀`,`▄`,`█`,`▌`,`▐`) and switch e-ink desktop art draw to `DrawStringAtUtf8` with width-safe clipping.
+4. Verify: run `platformio run`.
+5. Review: confirm no regressions in desktop notifications strip layout.
+
+## Execution Plan (WiFi Forget Network)
+1. Strategy: add a phone-like "forget network" action in WiFi manager without changing existing connect flow.
+2. Ideas: bind action to WiFi manager option `3`, clear persisted SSID/password, and disconnect only if the forgotten network is currently active.
+3. Build: extend `SettingsConnectivityService`, `SettingsInputManager`, and `DisplayManager` (OLED/e-ink labels + callback wiring).
+4. Verify: run `platformio run` after patch set.
+5. Review: ensure saved-password auto-fill still works only when current SSID matches the remaining stored credentials.
+
+## Stage Status (WiFi Forget Network)
+- Strategy: done, evidence: user requested explicit "forget network" behavior similar to phone UX, next stage: ideas.
+- Ideas: done, evidence: selected low-risk manager action (`3`) with config erase + conditional disconnect for active forgotten SSID, next stage: build.
+- Build: done, evidence: implemented `settingsServiceForgetWifi` and wired it through settings input context plus OLED/e-ink WiFi manager hints, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-10) after forget-network patch set, next stage: review.
+- Review: done, evidence: connect/scan/toggle paths are unchanged and saved-password prefill remains tied to exact SSID match, next stage: explain.
+
+## Execution Plan (Bluetooth Completion)
+1. Strategy: keep current BLE scan flow and add practical persistence/cleanup features without changing boot-time init ordering.
+2. Ideas: persist selected Bluetooth device label in config, add explicit "forget saved" action in Bluetooth manager, and keep disconnect behavior stable.
+3. Build: extend `AppConfig` + `ConfigStore`, add new operations in `SettingsConnectivityService`, and wire actions through `SettingsInputManager`/`DisplayManager`.
+4. Verify: run `platformio run` after patch set.
+5. Review: confirm Bluetooth scan/select/disconnect still works and saved device data can be erased from settings.
+
+## Stage Status (Bluetooth Completion)
+- Strategy: done, evidence: user requested finishing Bluetooth after WiFi completion, next stage: ideas.
+- Ideas: done, evidence: selected low-risk persistence + forget flow (no new background pairing logic), next stage: build.
+- Build: done, evidence: added `bt_preferred_device` config persistence and BT manager actions for select/save + forget saved device, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-10) after Bluetooth completion patch set, next stage: review.
+- Review: done, evidence: BT toggle/scan/disconnect path remains intact while saved-device lifecycle is now explicit, next stage: explain.
+
+## Stage Status (Bluetooth Connect Fix)
+- Strategy: done, evidence: user reported that Bluetooth still cannot connect in real usage, next stage: build.
+- Build: done, evidence: replaced state-only BT select with real BLE client connect by scanned MAC address and added address persistence (`bt_preferred_address`), next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-10) after BLE connect path patch, next stage: on-device smoke test.
+
+## Execution Plan (A2DP Transport Scaffold)
+1. Strategy: add a dedicated A2DP control surface now, then wire SD music app playback later.
+2. Ideas: integrate source start/stop/status via shell and persist preferred target name in config.
+3. Build: create `AudioManager` module and add shell command routing.
+4. Verify: run `platformio run`.
+5. Review: check hardware compatibility with ESP32-S3 Bluetooth capabilities.
+
+## Stage Status (A2DP Transport Scaffold)
+- Strategy: done, evidence: user requested A2DP now and SD-backed music app later, next stage: build.
+- Build: done, evidence: added `AudioManager` module and shell commands (`a2dp status|start|stop`) with persistent `a2dp_target_name`, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-10) after final fallback patch set, next stage: review.
+- Review: done, evidence: ESP32-S3 is BLE-only (no Bluetooth Classic), so true A2DP source is unsupported on this hardware; module now reports explicit unsupported status without destabilizing boot/shell, next stage: explain.
+
+## Execution Plan (Desktop Art Anchor Under Notifications)
+1. Strategy: keep current notifications strip behavior but stop desktop art re-centering when strip opens.
+2. Build: use fixed full-width content centering area on OLED and e-ink desktop paths.
+3. Verify: run `platformio run` and confirm no compile regressions.
+4. Review: visually confirm strip overlays right side while art baseline position remains unchanged.
+
+## Stage Status (E-ink Block ASCII Support)
+- Strategy: done, evidence: identified unsupported block glyphs in e-ink desktop path while OLED path already renders independently, next stage: ideas.
+- Ideas: done, evidence: selected low-risk renderer extension + `Font8` migration only for e-ink desktop art, next stage: build.
+- Build: done, evidence: patched `epdpaint.cpp` UTF-8 block glyph rendering and updated `DisplayManager.cpp` e-ink desktop art to `Font8` + UTF-8 clipping, next stage: verify.
+- Verify: done, evidence: `platformio run` compiled successfully (2026-04-08) after the block-glyph/Font8 patch, next stage: review on-device readability.
+- Optimize: done, evidence: added compact UTF-8 draw path with reduced glyph advance (`4px`) and tighter line spacing (`10px`) for e-ink desktop art only, next stage: on-device visual check.
+
+## Stage Status (Desktop Art Anchor Under Notifications)
+- Strategy: done, evidence: user requested that opening notification strip must not move text beneath it, next stage: build.
+- Build: done, evidence: patched desktop render centering width to fixed full width for OLED and e-ink branches, next stage: verify.
+
+## Stage Status (SD Settings Submenu)
+- Strategy: done, evidence: identified a single SD manager entry as the cleanest way to group the two SD settings.
+- Build: done, evidence: added SD manager view with toggle/speed actions, remapped settings home to 1..4, and removed numeric `0` as settings back.
+- Verify: done, evidence: `platformio run` SUCCESS after the final signature fix.
+- Review: done, evidence: left-arrow back now covers settings submenus including SD, while `0` is left as a normal key in password entry.
+
+## Stage Status (Bluetooth Manager Completion)
+- Strategy: done, evidence: identified explicit disconnect as the remaining Bluetooth UX gap.
+- Build: done, evidence: added `disconnectBluetooth` helper, Bluetooth manager action 3, and status text updates in OLED/e-ink settings views.
+- Verify: done, evidence: `platformio run` SUCCESS after the Bluetooth patch.
+- Review: done, evidence: Bluetooth now has toggle, scan, select, connect, and explicit disconnect paths with left-arrow back preserved.

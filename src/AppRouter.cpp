@@ -31,6 +31,10 @@ bool appRouterRenderActiveApp(
         return context.renderFileManagerScreen(state, oledOnly, out);
     }
 
+    if (state.launcher.activeAppId.equalsIgnoreCase("music-player") || state.launcher.activeAppId.equalsIgnoreCase("sdapp:music-player")) {
+        return context.renderMusicPlayerScreen(state, oledOnly, out);
+    }
+
     if (state.launcher.activeAppId.equalsIgnoreCase("web-upload")) {
         return context.renderWebUploadScreen(state, oledOnly, out);
     }
@@ -47,6 +51,7 @@ bool appRouterHandleBackInput(
     uint8_t settingsViewWifiSelectList,
     uint8_t settingsViewBluetoothList,
     uint8_t settingsViewBluetoothSelectList,
+    uint8_t settingsViewSdList,
     AppRouterInputContext &context,
     Stream &out) {
     if (!context.isLeftArrowCode(rawCode)) {
@@ -91,7 +96,7 @@ bool appRouterHandleBackInput(
             return true;
         }
 
-        if (state.settings.viewMode == settingsViewBluetoothList || state.settings.viewMode == settingsViewWifiList) {
+        if (state.settings.viewMode == settingsViewBluetoothList || state.settings.viewMode == settingsViewWifiList || state.settings.viewMode == settingsViewSdList) {
             state.settings.viewMode = settingsViewHome;
             state.settings.lastMessage = "back";
             context.renderSettingsScreen(state, false, out);

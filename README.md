@@ -88,6 +88,31 @@ Available commands include:
 - reboot
 - prompt
 
+## Music Player on SD
+
+The music-player app is a built-in screen, but its library lives on SD card.
+
+Expected SD layout:
+
+- /music-player/
+- /music-player/playlist.txt (optional)
+- /music-player/*.mp3 (or wav/aac/m4a/ogg/flac)
+
+If /music-player/playlist.txt exists, each non-empty line is treated as a track path.
+
+- Absolute path example: /music-player/album/song01.mp3
+- Relative path example: album/song01.mp3
+
+If no playlist file exists, the app scans files directly inside /music-player.
+
+Launcher behavior:
+
+- Built-in app id: music-player
+- SD manifest app id (optional): music-player in /apps/apps.txt (opens as sdapp:music-player)
+
+Note: ESP32-S3 does not execute native firmware code from SD card in this project.
+The app logic stays in firmware, while tracks and playlist/config data are loaded from SD.
+
 ## Build
 
 From the project root:

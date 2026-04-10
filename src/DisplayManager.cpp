@@ -30,6 +30,7 @@ constexpr uint8_t kOledCs = 10;
 constexpr LauncherApp kLauncherApps[] = {
     {"settings", "Settings", "Built-in config app"},
     {"file-manager", "File Manager", "SD file browser"},
+    {"music-player", "Music Player", "SD-backed audio library"},
     {"web-upload", "Web Upload", "Browser file upload"},
     {"apps", "SD Apps", "Loaded from manifest"},
     {"serial", "Serial", "Debug shell"},
@@ -65,6 +66,12 @@ String gSdApps[kMaxSdApps];
 size_t gSdAppCount = 0;
 bool gSdAppCacheDirty = true;
 bool gSdAppCachePrimed = false;
+constexpr size_t kMaxMusicTracks = 24;
+String gMusicTrackNames[kMaxMusicTracks];
+String gMusicTrackPaths[kMaxMusicTracks];
+size_t gMusicTrackCount = 0;
+bool gMusicCacheDirty = true;
+bool gMusicCachePrimed = false;
 uint32_t gLastDisplayActivityMs = 0;
 bool gEinkSleeping = false;
 bool gOledSleeping = false;
@@ -75,9 +82,8 @@ constexpr size_t kLauncherPageSize = 6;
 constexpr const char *kSettingsOptions[] = {
     "1) WiFi manager",
     "2) Bluetooth manager",
-    "3) SD enable toggle",
-    "4) SD speed cycle",
-    "5) Save config",
+    "3) SD manager",
+    "4) Save config",
 };
 
 constexpr uint8_t kSettingsOptionCount = sizeof(kSettingsOptions) / sizeof(kSettingsOptions[0]);
@@ -87,6 +93,7 @@ constexpr uint8_t kSettingsViewWifiPassword = 2;
 constexpr uint8_t kSettingsViewWifiSelectList = 3;
 constexpr uint8_t kSettingsViewBluetoothList = 4;
 constexpr uint8_t kSettingsViewBluetoothSelectList = 5;
+constexpr uint8_t kSettingsViewSdList = 6;
 constexpr size_t kMaxWifiNetworks = 24;
 constexpr size_t kWifiListVisibleCount = 9;
 String gWifiSsidList[kMaxWifiNetworks];
@@ -96,9 +103,12 @@ size_t gWifiCount = 0;
 size_t gWifiListScrollOffset = 0;
 // True while synchronous Wi-Fi scan is running.
 bool gWifiScanInProgress = false;
-constexpr size_t kMaxBluetoothDevices = 9;
+constexpr size_t kMaxBluetoothDevices = 24;
+constexpr size_t kBluetoothListVisibleCount = 9;
 String gBluetoothDeviceList[kMaxBluetoothDevices];
+String gBluetoothDeviceAddressList[kMaxBluetoothDevices];
 size_t gBluetoothDeviceCount = 0;
+size_t gBluetoothListScrollOffset = 0;
 bool gBluetoothScanInProgress = false;
 bool gBluetoothBleInitialized = false;
 char gCzechComposeDeadKey = 0;
@@ -117,6 +127,67 @@ bool isCardKbDownArrowCode(uint8_t code);
 bool isCardKbRightArrowCode(uint8_t code);
 bool isCardKbLeftArrowCode(uint8_t code);
 void prepareLandscapePaint(Paint &paint);
+size_t utf8GlyphCount(const char *text);
+String utf8ClipToGlyphs(const char *text, size_t maxGlyphs);
+void invalidateMusicPlayerCache();
+void resetMusicPlayerSession(SystemState &state);
+void refreshMusicPlayerLibrary(const SystemState &state, Stream &out);
+String musicPlayerTrackLabelAt(size_t index);
+void drawMusicPlayerOled(const SystemState &state);
+bool handleMusicPlayerAppInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out);
+bool renderMusicPlayerScreen(SystemState &state, bool oledOnly, Stream &out);
+
+size_t utf8GlyphCount(const char *text) {
+    if (!text) {
+        return 0;
+    }
+
+    size_t glyphs = 0;
+    const uint8_t *p = reinterpret_cast<const uint8_t *>(text);
+    while (*p != 0) {
+        if ((*p & 0x80) == 0x00) {
+            ++p;
+        } else if ((*p & 0xE0) == 0xC0 && p[1] != 0) {
+            p += 2;
+        } else if ((*p & 0xF0) == 0xE0 && p[1] != 0 && p[2] != 0) {
+            p += 3;
+        } else if ((*p & 0xF8) == 0xF0 && p[1] != 0 && p[2] != 0 && p[3] != 0) {
+            p += 4;
+        } else {
+            ++p;
+        }
+        ++glyphs;
+    }
+    return glyphs;
+}
+
+String utf8ClipToGlyphs(const char *text, size_t maxGlyphs) {
+    if (!text || maxGlyphs == 0) {
+        return String();
+    }
+
+    const uint8_t *start = reinterpret_cast<const uint8_t *>(text);
+    const uint8_t *p = start;
+    size_t glyphs = 0;
+
+    while (*p != 0 && glyphs < maxGlyphs) {
+        if ((*p & 0x80) == 0x00) {
+            ++p;
+        } else if ((*p & 0xE0) == 0xC0 && p[1] != 0) {
+            p += 2;
+        } else if ((*p & 0xF0) == 0xE0 && p[1] != 0 && p[2] != 0) {
+            p += 3;
+        } else if ((*p & 0xF8) == 0xF0 && p[1] != 0 && p[2] != 0 && p[3] != 0) {
+            p += 4;
+        } else {
+            ++p;
+        }
+        ++glyphs;
+    }
+
+    const size_t byteLen = static_cast<size_t>(p - start);
+    return String(reinterpret_cast<const char *>(start)).substring(0, byteLen);
+}
 
 String formatWifiDisplayLabel(size_t index) {
     String ssid = gWifiSsidList[index];
@@ -1222,6 +1293,9 @@ String launcherIconLabelAt(size_t absoluteIndex) {
     if (id.equalsIgnoreCase("web-upload")) {
         return String("UP");
     }
+    if (id.equalsIgnoreCase("music-player") || id.equalsIgnoreCase("sdapp:music-player")) {
+        return String("MP");
+    }
     if (id.equalsIgnoreCase("apps")) {
         return String("AP");
     }
@@ -1329,6 +1403,16 @@ void drawLauncherIcon(Paint &paint, int x, int y, int size, const String &itemId
         return;
     }
 
+    if (itemId.equalsIgnoreCase("music-player") || itemId.equalsIgnoreCase("sdapp:music-player")) {
+        paint.DrawLine(x + 4, y + 5, x + 4, y2 - 5, kColored);
+        paint.DrawLine(x + 4, y + 5, x + 12, y + 9, kColored);
+        paint.DrawLine(x + 12, y + 9, x + 8, y + 14, kColored);
+        paint.DrawLine(x + 8, y + 14, x + 12, y + 19, kColored);
+        paint.DrawLine(x + 12, y + 19, x + 4, y2 - 5, kColored);
+        paint.DrawLine(x + 14, y + 6, x + 14, y2 - 6, kColored);
+        return;
+    }
+
     if (itemId.equalsIgnoreCase("apps")) {
         paint.DrawRectangle(x + 3, y + 3, x + 8, y + 8, kColored);
         paint.DrawRectangle(x + 10, y + 3, x + 15, y + 8, kColored);
@@ -1397,6 +1481,11 @@ void drawActiveAppOled(const SystemState &state) {
         return;
     }
 
+    if (state.launcher.activeAppId.equalsIgnoreCase("music-player") || state.launcher.activeAppId.equalsIgnoreCase("sdapp:music-player")) {
+        drawMusicPlayerOled(state);
+        return;
+    }
+
     String title = String("app: ") + state.launcher.activeAppId;
     gOled.clearBuffer();
     gOled.setFont(u8g2_font_6x10_tf);
@@ -1449,7 +1538,8 @@ void drawSettingsOled(const SystemState &state) {
         gOled.drawStr(0, 22, "wifi manager");
         gOled.drawStr(0, 33, "1 toggle wifi");
         gOled.drawStr(0, 44, "2 connect wifi");
-        gOled.drawStr(0, 55, "<- back");
+        gOled.drawStr(0, 55, "3 forget saved");
+        gOled.drawStr(64, 55, "<- back");
         gOled.setCursor(0, 64);
         gOled.print(state.settings.wifiEnabled ? "wifi:on" : "wifi:off");
         if (state.settings.wifiConnected && !state.settings.wifiConnectedSsid.isEmpty()) {
@@ -1479,7 +1569,9 @@ void drawSettingsOled(const SystemState &state) {
             gOled.drawStr(0, 22, "bluetooth manager");
             gOled.drawStr(0, 33, "1 toggle bt");
             gOled.drawStr(0, 44, "2 scan devices");
-            gOled.drawStr(0, 55, "<- back");
+            gOled.drawStr(0, 55, "3 disconnect");
+            gOled.drawStr(64, 55, "4 forget");
+            gOled.drawStr(64, 64, "<- back");
         }
         gOled.setCursor(0, 64);
         gOled.print(state.settings.btEnabled ? "bt:on" : "bt:off");
@@ -1496,6 +1588,16 @@ void drawSettingsOled(const SystemState &state) {
         gOled.print(gBluetoothDeviceCount);
         gOled.print("  last: ");
         gOled.print(state.settings.lastMessage);
+    } else if (state.settings.viewMode == kSettingsViewSdList) {
+        String sdLine = String("sd:") + (state.config.sdEnabled ? "on" : "off");
+        sdLine += " ";
+        sdLine += String(state.config.sdProbeSpeed);
+        gOled.drawStr(0, 22, "sd manager");
+        gOled.drawStr(0, 33, "1 toggle sd");
+        gOled.drawStr(0, 44, "2 cycle speed");
+        gOled.drawStr(0, 55, "<- back");
+        gOled.setCursor(0, 64);
+        gOled.print(sdLine);
     } else {
         // Password entry view. We keep OLED as the live typing surface.
         String passwordPreview = state.settings.wifiPassword;
@@ -1514,7 +1616,7 @@ void drawSettingsOled(const SystemState &state) {
         gOled.print('_');
         gOled.setCursor(0, 56);
         gOled.print(state.settings.lastMessage);
-        gOled.drawStr(0, 64, "enter=connect  backsp/0");
+        gOled.drawStr(0, 64, "enter=connect  <- back");
     }
     gOled.sendBuffer();
 }
@@ -1570,6 +1672,7 @@ void drawSettingsEink(SystemState &state) {
         }
         paint.DrawStringAt(10, 110, "1) Toggle WiFi ON/OFF", &Font12, kColored);
         paint.DrawStringAt(10, 126, "2) Connect to WiFi", &Font12, kColored);
+        paint.DrawStringAt(10, 142, "3) Forget saved network", &Font12, kColored);
         paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
         paint.DrawStringAt(10, 218, "Left arrow = back", &Font12, kColored);
     } else if (state.settings.viewMode == kSettingsViewWifiSelectList) {
@@ -1619,13 +1722,22 @@ void drawSettingsEink(SystemState &state) {
         }
         paint.DrawStringAt(10, 110, "1) Toggle Bluetooth ON/OFF", &Font12, kColored);
         paint.DrawStringAt(10, 126, "2) Scan devices", &Font12, kColored);
+        paint.DrawStringAt(10, 142, "3) Disconnect current", &Font12, kColored);
+        paint.DrawStringAt(10, 158, "4) Forget saved device", &Font12, kColored);
+        if (!state.config.btPreferredDevice.isEmpty()) {
+            String preferredLine = String("saved: ") + state.config.btPreferredDevice;
+            paint.DrawStringAtUtf8(10, 176, preferredLine.c_str(), &Font12, kColored);
+        }
         paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
         paint.DrawStringAt(10, 218, "Left arrow = back", &Font12, kColored);
     } else if (state.settings.viewMode == kSettingsViewBluetoothSelectList) {
         paint.DrawStringAt(10, 42, "Available Bluetooth:", &Font12, kColored);
+        const size_t maxOffset = gBluetoothDeviceCount > kBluetoothListVisibleCount ? gBluetoothDeviceCount - kBluetoothListVisibleCount : 0;
+        const size_t startIndex = min(gBluetoothListScrollOffset, maxOffset);
+        const size_t endIndex = min(startIndex + kBluetoothListVisibleCount, gBluetoothDeviceCount);
         int y = 58;
-        for (size_t i = 0; i < gBluetoothDeviceCount && i < kMaxBluetoothDevices; ++i) {
-            String line = String(static_cast<unsigned>(i + 1));
+        for (size_t i = startIndex; i < endIndex; ++i) {
+            String line = String(static_cast<unsigned>((i - startIndex) + 1));
             line += ") ";
             line += gBluetoothDeviceList[i];
             paint.DrawStringAtUtf8(10, y, line.c_str(), &Font12, kColored);
@@ -1633,9 +1745,28 @@ void drawSettingsEink(SystemState &state) {
         }
         if (gBluetoothDeviceCount == 0) {
             paint.DrawStringAt(10, 76, "No devices found", &Font12, kColored);
+        } else if (gBluetoothDeviceCount > kBluetoothListVisibleCount) {
+            String pageLine = String("page ") + String(static_cast<unsigned>(startIndex + 1));
+            pageLine += "-";
+            pageLine += String(static_cast<unsigned>(endIndex));
+            pageLine += "/";
+            pageLine += String(static_cast<unsigned>(gBluetoothDeviceCount));
+            paint.DrawStringAt(10, 202, pageLine.c_str(), &Font12, kColored);
+            paint.DrawStringAt(150, 202, "^ up", &Font12, kColored);
+            paint.DrawStringAt(200, 202, "down", &Font12, kColored);
         }
         paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
-        paint.DrawStringAt(10, 218, "Type 1..9 to select, left back", &Font12, kColored);
+        paint.DrawStringAt(10, 218, "1..9 select, up/down page", &Font12, kColored);
+    } else if (state.settings.viewMode == kSettingsViewSdList) {
+        const String sdState = String("sd: ") + (state.config.sdEnabled ? "on" : "off");
+        const String sdSpeed = String("speed: ") + String(state.config.sdProbeSpeed) + " hz";
+        paint.DrawStringAt(10, 42, "SD manager", &Font16, kColored);
+        paint.DrawStringAt(10, 66, sdState.c_str(), &Font12, kColored);
+        paint.DrawStringAt(10, 82, sdSpeed.c_str(), &Font12, kColored);
+        paint.DrawStringAt(10, 110, "1) Toggle SD ON/OFF", &Font12, kColored);
+        paint.DrawStringAt(10, 126, "2) Cycle SD speed", &Font12, kColored);
+        paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
+        paint.DrawStringAt(10, 218, "Left arrow = back", &Font12, kColored);
     } else {
         // Password view: e-ink only shows context, typing remains on OLED.
         const String selectedSsidUtf8 = state.settings.selectedSsid;
@@ -1644,7 +1775,7 @@ void drawSettingsEink(SystemState &state) {
         paint.DrawStringAt(10, 60, "Password on OLED keyboard", &Font12, kColored);
         paint.DrawStringAt(10, 78, "Press ENTER to connect", &Font12, kColored);
         paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
-        paint.DrawStringAt(10, 218, "0 cancel", &Font12, kColored);
+        paint.DrawStringAt(10, 218, "Left arrow cancels", &Font12, kColored);
     }
 
     gEink.display(paint.GetImage());
@@ -1671,13 +1802,26 @@ bool connectSelectedWifi(SystemState &state, Stream &out) {
     return settingsServiceConnectSelectedWifi(state, out);
 }
 
+bool forgetSavedWifi(SystemState &state, Stream &out) {
+    return settingsServiceForgetWifi(state, out);
+}
+
 bool toggleBluetoothEnabled(SystemState &state, Stream &out) {
     return settingsServiceToggleBluetooth(state, out);
+}
+
+bool selectBluetoothDevice(SystemState &state, const String &deviceName, const String &deviceAddress, int8_t selectedIndex, Stream &out) {
+    return settingsServiceSelectBluetoothDevice(state, deviceName, deviceAddress, selectedIndex, out);
+}
+
+bool forgetSavedBluetoothDevice(SystemState &state, Stream &out) {
+    return settingsServiceForgetBluetoothDevice(state, out);
 }
 
 size_t scanBluetoothDevices(Stream &out) {
     gBluetoothDeviceCount = settingsServiceScanBluetoothDevices(
         gBluetoothDeviceList,
+        gBluetoothDeviceAddressList,
         kMaxBluetoothDevices,
         gBluetoothBleInitialized,
         out);
@@ -1893,21 +2037,13 @@ bool applySettingsSelection(SystemState &state, uint8_t optionIndex, Stream &out
     }
 
     if (optionIndex == 2) {
-        state.config.sdEnabled = !state.config.sdEnabled;
-        state.settings.lastMessage = state.config.sdEnabled ? "sd enabled" : "sd disabled";
-        out.println("Settings: sd enabled toggled");
+        state.settings.viewMode = kSettingsViewSdList;
+        state.settings.lastMessage = "sd manager";
+        out.println("Settings: sd manager open");
         return true;
     }
 
     if (optionIndex == 3) {
-        cycleSdSpeed(state.config);
-        state.settings.lastMessage = String("sd ") + state.config.sdProbeSpeed;
-        out.print("Settings: sd speed set to ");
-        out.println(state.config.sdProbeSpeed);
-        return true;
-    }
-
-    if (optionIndex == 4) {
         const bool ok = saveConfig(state.config);
         state.settings.lastMessage = ok ? "config saved" : "save failed";
         out.println(ok ? "Settings: config saved" : "Settings: config save failed");
@@ -1945,6 +2081,396 @@ bool renderPlaceholderApp(SystemState &state, Stream &out) {
     }
 
     out.println("App placeholder rendered");
+    return true;
+}
+
+String musicPlayerBaseNameFromPath(const String &path) {
+    String fileName = path;
+    int slash = fileName.lastIndexOf('/');
+    if (slash >= 0 && slash + 1 < static_cast<int>(fileName.length())) {
+        fileName = fileName.substring(slash + 1);
+    }
+
+    int dot = fileName.lastIndexOf('.');
+    if (dot > 0) {
+        fileName = fileName.substring(0, dot);
+    }
+
+    fileName.trim();
+    return fileName;
+}
+
+bool isMusicTrackPath(const String &path) {
+    String lowered = path;
+    lowered.toLowerCase();
+    return lowered.endsWith(".mp3") || lowered.endsWith(".wav") || lowered.endsWith(".aac") || lowered.endsWith(".m4a") || lowered.endsWith(".ogg") || lowered.endsWith(".flac");
+}
+
+void invalidateMusicPlayerCache() {
+    gMusicCacheDirty = true;
+    gMusicCachePrimed = false;
+}
+
+void resetMusicPlayerSession(SystemState &state) {
+    state.musicPlayer.selectedIndex = 0;
+    state.musicPlayer.scrollOffset = 0;
+    state.musicPlayer.playing = false;
+    state.musicPlayer.nowPlaying = "";
+    state.musicPlayer.statusMessage = "ready";
+    invalidateMusicPlayerCache();
+}
+
+String musicPlayerTrackLabelAt(size_t index) {
+    if (index >= gMusicTrackCount) {
+        return String();
+    }
+
+    return gMusicTrackNames[index];
+}
+
+void musicPlayerStoreTrack(const String &path) {
+    if (gMusicTrackCount >= kMaxMusicTracks) {
+        return;
+    }
+
+    gMusicTrackPaths[gMusicTrackCount] = path;
+    gMusicTrackNames[gMusicTrackCount] = musicPlayerBaseNameFromPath(path);
+    if (gMusicTrackNames[gMusicTrackCount].isEmpty()) {
+        gMusicTrackNames[gMusicTrackCount] = path;
+    }
+    ++gMusicTrackCount;
+}
+
+void musicPlayerCollectFromDirectory(File directory, const String &prefix) {
+    File entry = directory.openNextFile();
+    while (entry && gMusicTrackCount < kMaxMusicTracks) {
+        String entryName = entry.name();
+        if (entry.isDirectory()) {
+            entry.close();
+            entry = directory.openNextFile();
+            continue;
+        }
+
+        String fullPath = prefix;
+        if (!fullPath.endsWith("/")) {
+            fullPath += "/";
+        }
+        fullPath += entryName;
+        if (isMusicTrackPath(fullPath)) {
+            musicPlayerStoreTrack(fullPath);
+        }
+
+        entry.close();
+        entry = directory.openNextFile();
+    }
+}
+
+void musicPlayerCollectFromPlaylist(File playlist, const String &basePath) {
+    while (playlist.available() && gMusicTrackCount < kMaxMusicTracks) {
+        String line = playlist.readStringUntil('\n');
+        line.trim();
+        if (line.isEmpty() || line.startsWith("#") || line.startsWith(";")) {
+            continue;
+        }
+
+        String fullPath = line;
+        if (!fullPath.startsWith("/")) {
+            fullPath = basePath;
+            if (!fullPath.endsWith("/")) {
+                fullPath += "/";
+            }
+            fullPath += line;
+        }
+
+        if (isMusicTrackPath(fullPath)) {
+            musicPlayerStoreTrack(fullPath);
+        }
+    }
+}
+
+void refreshMusicPlayerLibrary(const SystemState &state, Stream &out) {
+    if (!state.sdReady) {
+        gMusicTrackCount = 0;
+        gMusicCacheDirty = false;
+        gMusicCachePrimed = true;
+        return;
+    }
+
+    if (gMusicCachePrimed && !gMusicCacheDirty) {
+        return;
+    }
+
+    gMusicTrackCount = 0;
+    const String libraryPath = state.musicPlayer.libraryPath.length() ? state.musicPlayer.libraryPath : String("/music-player");
+    if (!SD.exists(libraryPath)) {
+        out.print("Music player: folder not found (");
+        out.print(libraryPath);
+        out.println(")");
+        gMusicCacheDirty = false;
+        gMusicCachePrimed = true;
+        return;
+    }
+
+    File root = SD.open(libraryPath, FILE_READ);
+    if (!root) {
+        out.print("Music player: cannot open ");
+        out.println(libraryPath);
+        gMusicCacheDirty = false;
+        gMusicCachePrimed = true;
+        return;
+    }
+
+    if (!root.isDirectory()) {
+        out.print("Music player: path is not a folder ");
+        out.println(libraryPath);
+        root.close();
+        gMusicCacheDirty = false;
+        gMusicCachePrimed = true;
+        return;
+    }
+
+    const String playlistPath = libraryPath + "/playlist.txt";
+    if (SD.exists(playlistPath)) {
+        File playlist = SD.open(playlistPath, FILE_READ);
+        if (playlist) {
+            musicPlayerCollectFromPlaylist(playlist, libraryPath);
+            playlist.close();
+        }
+    }
+
+    if (gMusicTrackCount == 0) {
+        musicPlayerCollectFromDirectory(root, libraryPath);
+    }
+
+    root.close();
+    gMusicCacheDirty = false;
+    gMusicCachePrimed = true;
+    out.print("Music player tracks loaded: ");
+    out.println(gMusicTrackCount);
+}
+
+void drawMusicPlayerOled(const SystemState &state) {
+    if (!state.oledReady) {
+        return;
+    }
+
+    const size_t totalCount = gMusicTrackCount;
+    const size_t safeIndex = totalCount == 0 ? 0 : min(static_cast<size_t>(state.musicPlayer.selectedIndex), totalCount - 1);
+    const size_t pageCount = totalCount == 0 ? 1 : ((totalCount + 3) / 4);
+    const size_t pageIndex = totalCount == 0 ? 0 : (safeIndex / 4);
+    const size_t startIndex = pageIndex * 4;
+    const size_t endIndex = min(startIndex + 4, totalCount);
+
+    gOled.clearBuffer();
+    gOled.setFont(u8g2_font_4x6_tf);
+    gOled.setCursor(0, 7);
+    gOled.print("music ");
+    gOled.print(pageIndex + 1);
+    gOled.print("/");
+    gOled.print(pageCount);
+
+    gOled.setCursor(0, 15);
+    gOled.print(state.musicPlayer.playing ? "playing" : "paused");
+    gOled.print(" ");
+    gOled.print(state.musicPlayer.statusMessage);
+
+    String currentLabel = state.musicPlayer.nowPlaying;
+    if (currentLabel.isEmpty() && totalCount > 0) {
+        currentLabel = musicPlayerTrackLabelAt(safeIndex);
+    }
+    gOled.setCursor(0, 23);
+    gOled.print(currentLabel);
+
+    int y = 33;
+    for (size_t index = startIndex; index < endIndex && y <= 57; ++index) {
+        String line = (index == safeIndex) ? ">" : " ";
+        line += String(static_cast<unsigned>((index - startIndex) + 1));
+        line += " ";
+        line += musicPlayerTrackLabelAt(index);
+        gOled.drawStr(0, y, line.c_str());
+        y += 8;
+    }
+
+    gOled.setCursor(0, 63);
+    gOled.print("1 play 2 next 3 prev 4 rescan");
+    gOled.sendBuffer();
+}
+
+void drawMusicPlayerEink(const SystemState &state) {
+    Paint paint(gEinkBuffer, kEinkNativeWidth, kEinkNativeHeight);
+    prepareLandscapePaint(paint);
+    paint.Clear(kUncolored);
+    paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
+    paint.DrawStringAt(8, 10, "MUSIC PLAYER", &Font16, kColored);
+    paint.DrawLine(0, 32, kEinkLandscapeWidth - 1, 32, kColored);
+
+    String statusLine = state.musicPlayer.playing ? "playing" : "paused";
+    if (!state.musicPlayer.statusMessage.isEmpty()) {
+        statusLine += " | ";
+        statusLine += state.musicPlayer.statusMessage;
+    }
+    paint.DrawStringAtUtf8(8, 44, statusLine.c_str(), &Font12, kColored);
+
+    String currentLabel = state.musicPlayer.nowPlaying;
+    if (currentLabel.isEmpty() && gMusicTrackCount > 0) {
+        currentLabel = musicPlayerTrackLabelAt(min(static_cast<size_t>(state.musicPlayer.selectedIndex), gMusicTrackCount - 1));
+    }
+    paint.DrawStringAtUtf8(8, 62, currentLabel.isEmpty() ? "no track selected" : currentLabel.c_str(), &Font12, kColored);
+    paint.DrawStringAtUtf8(8, 80, state.musicPlayer.libraryPath.c_str(), &Font12, kColored);
+
+    const size_t totalCount = gMusicTrackCount;
+    const size_t safeIndex = totalCount == 0 ? 0 : min(static_cast<size_t>(state.musicPlayer.selectedIndex), totalCount - 1);
+    const size_t pageStart = (totalCount == 0) ? 0 : (safeIndex / 5) * 5;
+    const size_t pageEnd = min(pageStart + 5, totalCount);
+    int y = 100;
+    for (size_t index = pageStart; index < pageEnd && y < 122; ++index) {
+        String line = (index == safeIndex) ? "> " : "  ";
+        line += String(static_cast<unsigned>(index + 1));
+        line += ". ";
+        line += musicPlayerTrackLabelAt(index);
+        paint.DrawStringAtUtf8(8, y, line.c_str(), &Font12, kColored);
+        y += 16;
+    }
+
+    paint.DrawStringAt(168, 104, "1 play/pause", &Font12, kColored);
+    paint.DrawStringAt(168, 120, "2 next | 3 prev", &Font12, kColored);
+    paint.DrawStringAt(168, 136, "4 rescan | <- back", &Font12, kColored);
+
+    gEink.display(paint.GetImage());
+    refreshEinkWithCadence(false);
+}
+
+bool handleMusicPlayerAppInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out) {
+    refreshMusicPlayerLibrary(state, out);
+
+    const size_t totalCount = gMusicTrackCount;
+    const bool hasTracks = totalCount > 0;
+    if (hasTracks && state.musicPlayer.selectedIndex >= totalCount) {
+        state.musicPlayer.selectedIndex = static_cast<uint8_t>(totalCount - 1);
+    }
+
+    auto syncNowPlaying = [&]() {
+        if (hasTracks) {
+            state.musicPlayer.nowPlaying = musicPlayerTrackLabelAt(state.musicPlayer.selectedIndex);
+        } else {
+            state.musicPlayer.nowPlaying = "";
+        }
+    };
+
+    if (isCardKbUpArrowCode(rawCode)) {
+        if (hasTracks) {
+            if (state.musicPlayer.selectedIndex == 0) {
+                state.musicPlayer.selectedIndex = static_cast<uint8_t>(totalCount - 1);
+            } else {
+                --state.musicPlayer.selectedIndex;
+            }
+            syncNowPlaying();
+            state.musicPlayer.statusMessage = "track prev";
+        } else {
+            state.musicPlayer.statusMessage = "no tracks";
+        }
+        return true;
+    }
+
+    if (isCardKbDownArrowCode(rawCode)) {
+        if (hasTracks) {
+            state.musicPlayer.selectedIndex = static_cast<uint8_t>((state.musicPlayer.selectedIndex + 1) % totalCount);
+            syncNowPlaying();
+            state.musicPlayer.statusMessage = "track next";
+        } else {
+            state.musicPlayer.statusMessage = "no tracks";
+        }
+        return true;
+    }
+
+    if (normalizedKey == '1' || normalizedKey == ' ' || normalizedKey == '\r') {
+        state.musicPlayer.playing = !state.musicPlayer.playing;
+        syncNowPlaying();
+        state.musicPlayer.statusMessage = state.musicPlayer.playing ? "playing" : "paused";
+        return true;
+    }
+
+    if (normalizedKey == '2') {
+        if (hasTracks) {
+            state.musicPlayer.selectedIndex = static_cast<uint8_t>((state.musicPlayer.selectedIndex + 1) % totalCount);
+            syncNowPlaying();
+            state.musicPlayer.statusMessage = "next track";
+        } else {
+            state.musicPlayer.statusMessage = "no tracks";
+        }
+        return true;
+    }
+
+    if (normalizedKey == '3') {
+        if (hasTracks) {
+            if (state.musicPlayer.selectedIndex == 0) {
+                state.musicPlayer.selectedIndex = static_cast<uint8_t>(totalCount - 1);
+            } else {
+                --state.musicPlayer.selectedIndex;
+            }
+            syncNowPlaying();
+            state.musicPlayer.statusMessage = "previous track";
+        } else {
+            state.musicPlayer.statusMessage = "no tracks";
+        }
+        return true;
+    }
+
+    if (normalizedKey == '4' || normalizedKey == 'r' || normalizedKey == 'R') {
+        invalidateMusicPlayerCache();
+        refreshMusicPlayerLibrary(state, out);
+        if (gMusicTrackCount > 0) {
+            if (state.musicPlayer.selectedIndex >= gMusicTrackCount) {
+                state.musicPlayer.selectedIndex = static_cast<uint8_t>(gMusicTrackCount - 1);
+            }
+            syncNowPlaying();
+        } else {
+            state.musicPlayer.nowPlaying = "";
+        }
+        state.musicPlayer.statusMessage = "library rescan";
+        return true;
+    }
+
+    return false;
+}
+
+bool renderMusicPlayerScreen(SystemState &state, bool oledOnly, Stream &out) {
+    if (state.musicPlayer.libraryPath.isEmpty()) {
+        state.musicPlayer.libraryPath = "/music-player";
+    }
+
+    refreshMusicPlayerLibrary(state, out);
+
+    const size_t totalCount = gMusicTrackCount;
+    if (totalCount > 0 && state.musicPlayer.selectedIndex >= totalCount) {
+        state.musicPlayer.selectedIndex = static_cast<uint8_t>(totalCount - 1);
+    }
+
+    if (state.musicPlayer.playing && state.musicPlayer.nowPlaying.isEmpty() && totalCount > 0) {
+        state.musicPlayer.nowPlaying = musicPlayerTrackLabelAt(state.musicPlayer.selectedIndex);
+    }
+
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        drawMusicPlayerOled(state);
+        xSemaphoreGive(state.spiMutex);
+    }
+
+    if (oledOnly) {
+        return state.oledReady;
+    }
+
+    if (!ensureEinkInitialized(state, out)) {
+        out.println("OLED: music player rendered");
+        return state.oledReady;
+    }
+
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        drawMusicPlayerEink(state);
+        xSemaphoreGive(state.spiMutex);
+    }
+
+    markDisplayActivity();
+    out.println("E-ink: music player rendered");
     return true;
 }
 
@@ -2246,15 +2772,16 @@ bool renderDesktopScreen(SystemState &state, bool oledOnly, Stream &out) {
     if (state.oledReady && state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         const bool notifStripVisible = state.notifications.viewMode == 1;
         const int panelWidth = 42;  // ~1/3 of 128px OLED width.
-        const int contentWidth = notifStripVisible ? (128 - panelWidth - 2) : 128;
+        const int contentWidth = 128;
         const int contentStartX = 0;
         const char *artLines[] = {
-            R"(  _   _   ____    _   _      )",
-            R"( | \ | | / ___|  | \ | |     )",
-            R"( |  \| | \___ \  |  \| |     )",
-            R"( | |\  |  ___) | | |\  |     )",
-            R"( |_| \_| |____/  |_| \_|     )",
-            R"(           noteWAVE           )"
+R"( ▄▀▀▄ ▀▄  ▄▀▀▀▀▄   ▄▀▀▀█▀▀▄  ▄▀▀█▄▄▄▄  ▄▀▀▄    ▄▀▀▄  ▄▀▀█▄   ▄▀▀▄    ▄▀▀▄  ▄▀▀█▄▄▄▄ )",
+R"(█  █ █ █ █      █ █    █  ▐ ▐  ▄▀   ▐ █   █    ▐  █ ▐ ▄▀ ▀▄ █   █    ▐  █ ▐  ▄▀   ▐ )",
+R"(▐  █  ▀█ █      █ ▐   █       █▄▄▄▄▄  ▐  █        █   █▄▄▄█ ▐  █        █   █▄▄▄▄▄  )",
+R"(  █   █  ▀▄    ▄▀    █        █    ▌    █   ▄    █   ▄▀   █   █   ▄    █    █    ▌  )",
+R"(▄▀   █     ▀▀▀▀    ▄▀        ▄▀▄▄▄▄      ▀▄▀ ▀▄ ▄▀  █   ▄▀     ▀▄▀ ▀▄ ▄▀   ▄▀▄▄▄▄   )",
+R"(█    ▐            █          █    ▐            ▀    ▐   ▐            ▀     █    ▐   )",
+R"(▐                 ▐          ▐                                             ▐        )"
         };
         const size_t artLineCount = sizeof(artLines) / sizeof(artLines[0]);
         const int lineHeight = 8;
@@ -2272,6 +2799,9 @@ bool renderDesktopScreen(SystemState &state, bool oledOnly, Stream &out) {
 
         if (notifStripVisible) {
             const int panelX = 128 - panelWidth;
+            gOled.setDrawColor(0);
+            gOled.drawBox(panelX, 0, panelWidth, 64);
+            gOled.setDrawColor(1);
             gOled.drawFrame(panelX, 0, panelWidth, 64);
             gOled.drawLine(panelX, 0, panelX, 63);
             gOled.setFont(u8g2_font_4x6_tf);
@@ -2299,17 +2829,19 @@ bool renderDesktopScreen(SystemState &state, bool oledOnly, Stream &out) {
         const int panelWidth = kEinkLandscapeWidth / 3;
         const int panelX = kEinkLandscapeWidth - panelWidth;
         const int contentStartX = 0;
-        const int contentWidth = notifStripVisible ? panelX : kEinkLandscapeWidth;
+        const int contentWidth = kEinkLandscapeWidth;
+        constexpr int kArtGlyphAdvance = 4;
         const char *artLines[] = {
-            R"(  _   _   ____    _   _      )",
-            R"( | \ | | / ___|  | \ | |     )",
-            R"( |  \| | \___ \  |  \| |     )",
-            R"( | |\  |  ___) | | |\  |     )",
-            R"( |_| \_| |____/  |_| \_|     )",
-            R"(           noteWAVE           )"
+R"( ▄▀▀▄ ▀▄  ▄▀▀▀▀▄   ▄▀▀▀█▀▀▄  ▄▀▀█▄▄▄▄  ▄▀▀▄    ▄▀▀▄  ▄▀▀█▄   ▄▀▀▄    ▄▀▀▄  ▄▀▀█▄▄▄▄ )",
+R"(█  █ █ █ █      █ █    █  ▐ ▐  ▄▀   ▐ █   █    ▐  █ ▐ ▄▀ ▀▄ █   █    ▐  █ ▐  ▄▀   ▐ )",
+R"(▐  █  ▀█ █      █ ▐   █       █▄▄▄▄▄  ▐  █        █   █▄▄▄█ ▐  █        █   █▄▄▄▄▄  )",
+R"(  █   █  ▀▄    ▄▀    █        █    ▌    █   ▄    █   ▄▀   █   █   ▄    █    █    ▌  )",
+R"(▄▀   █     ▀▀▀▀    ▄▀        ▄▀▄▄▄▄      ▀▄▀ ▀▄ ▄▀  █   ▄▀     ▀▄▀ ▀▄ ▄▀   ▄▀▄▄▄▄   )",
+R"(█    ▐            █          █    ▐            ▀    ▐   ▐            ▀     █    ▐   )",
+R"(▐                 ▐          ▐                                             ▐        )"
         };
         const size_t artLineCount = sizeof(artLines) / sizeof(artLines[0]);
-        const int lineHeight = 18;
+        const int lineHeight = 10;
         const int artHeight = static_cast<int>(artLineCount) * lineHeight;
         const int artStartY = max(56, (kEinkLandscapeHeight - artHeight) / 2);
 
@@ -2320,14 +2852,17 @@ bool renderDesktopScreen(SystemState &state, bool oledOnly, Stream &out) {
         paint.DrawStringAt(8, 10, "NOTEWAVE", &Font16, kColored);
         paint.DrawLine(0, 32, kEinkLandscapeWidth - 1, 32, kColored);
 
+        const size_t maxGlyphsPerLine = max<size_t>(1, static_cast<size_t>(contentWidth / kArtGlyphAdvance));
         for (size_t i = 0; i < artLineCount; ++i) {
-            const int lineWidth = static_cast<int>(String(artLines[i]).length()) * 7;
+            String line = utf8ClipToGlyphs(artLines[i], maxGlyphsPerLine);
+            const int lineWidth = static_cast<int>(utf8GlyphCount(line.c_str()) * kArtGlyphAdvance);
             const int x = contentStartX + max(0, (contentWidth - lineWidth) / 2);
             const int y = artStartY + static_cast<int>(i) * lineHeight;
-            paint.DrawStringAt(x, y, artLines[i], &Font12, kColored);
+            paint.DrawStringAtUtf8Compact(x, y, line.c_str(), &Font8, kColored, kArtGlyphAdvance);
         }
 
         if (notifStripVisible) {
+            paint.DrawFilledRectangle(panelX, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kUncolored);
             paint.DrawRectangle(panelX, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
             paint.DrawLine(panelX, 0, panelX, kEinkLandscapeHeight - 1, kColored);
             paint.DrawStringAt(panelX + 8, 18, "UPOZORNENI", &Font12, kColored);
@@ -2362,6 +2897,7 @@ bool renderActiveApp(SystemState &state, bool oledOnly, Stream &out) {
     context.renderLauncherScreen = renderLauncherScreen;
     context.renderSettingsScreen = renderSettingsScreen;
     context.renderFileManagerScreen = renderFileManagerScreen;
+    context.renderMusicPlayerScreen = renderMusicPlayerScreen;
     context.renderWebUploadScreen = renderWebUploadScreen;
     context.renderPlaceholderApp = renderPlaceholderApp;
     return appRouterRenderActiveApp(state, oledOnly, out, context);
@@ -2400,6 +2936,14 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
         }
     }
 
+    if (state.launcher.activeAppId.equalsIgnoreCase("music-player") || state.launcher.activeAppId.equalsIgnoreCase("sdapp:music-player")) {
+        const char musicNormalizedKey = decodeCardKbKey(key);
+        if (handleMusicPlayerAppInput(state, musicNormalizedKey, rawCode, out)) {
+            renderMusicPlayerScreen(state, false, out);
+            return true;
+        }
+    }
+
     if (appRouterHandleBackInput(
             state,
             rawCode,
@@ -2409,6 +2953,7 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             kSettingsViewWifiSelectList,
             kSettingsViewBluetoothList,
             kSettingsViewBluetoothSelectList,
+            kSettingsViewSdList,
             inputContext,
             out)) {
         return true;
@@ -2473,6 +3018,8 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
                     state.settings.lastMessage = String("opened ") + targetTitle;
                     if (targetId.equalsIgnoreCase("file-manager")) {
                         fileManagerResetSession(state);
+                    } else if (targetId.equalsIgnoreCase("music-player") || targetId.equalsIgnoreCase("sdapp:music-player")) {
+                        resetMusicPlayerSession(state);
                     }
                     out.print("Launcher: opening ");
                     out.println(targetId);
@@ -2502,15 +3049,22 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
         settingsInputContext.wifiScanInProgress = &gWifiScanInProgress;
         settingsInputContext.wifiSsidList = gWifiSsidList;
         settingsInputContext.bluetoothDeviceCount = &gBluetoothDeviceCount;
+        settingsInputContext.bluetoothListVisibleCount = kBluetoothListVisibleCount;
+        settingsInputContext.bluetoothListScrollOffset = &gBluetoothListScrollOffset;
         settingsInputContext.bluetoothScanInProgress = &gBluetoothScanInProgress;
         settingsInputContext.bluetoothDeviceList = gBluetoothDeviceList;
+        settingsInputContext.bluetoothDeviceAddressList = gBluetoothDeviceAddressList;
         settingsInputContext.czechComposeDeadKey = &gCzechComposeDeadKey;
         settingsInputContext.isUpArrowCode = isCardKbUpArrowCode;
         settingsInputContext.isDownArrowCode = isCardKbDownArrowCode;
         settingsInputContext.toggleWifiEnabled = toggleWifiEnabled;
         settingsInputContext.scanWifiNetworks = scanWifiNetworks;
         settingsInputContext.connectSelectedWifi = connectSelectedWifi;
+        settingsInputContext.forgetSavedWifi = forgetSavedWifi;
         settingsInputContext.toggleBluetoothEnabled = toggleBluetoothEnabled;
+        settingsInputContext.disconnectBluetooth = settingsServiceDisconnectBluetooth;
+        settingsInputContext.selectBluetoothDevice = selectBluetoothDevice;
+        settingsInputContext.forgetSavedBluetoothDevice = forgetSavedBluetoothDevice;
         settingsInputContext.scanBluetoothDevices = scanBluetoothDevices;
         settingsInputContext.tryApplyPostfixCzechCompose = tryApplyPostfixCzechCompose;
         settingsInputContext.decodeCzechComposeKey = decodeCzechComposeKey;
@@ -2528,6 +3082,7 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             kSettingsViewWifiSelectList,
             kSettingsViewBluetoothList,
             kSettingsViewBluetoothSelectList,
+            kSettingsViewSdList,
             kSettingsViewHome,
             settingsInputContext,
             out);

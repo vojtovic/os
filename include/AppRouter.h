@@ -10,6 +10,7 @@ struct AppRouterRenderContext {
     bool (*renderLauncherScreen)(SystemState &state, bool oledOnly, Stream &out) = nullptr;
     bool (*renderSettingsScreen)(SystemState &state, bool oledOnly, Stream &out) = nullptr;
     bool (*renderFileManagerScreen)(SystemState &state, bool oledOnly, Stream &out) = nullptr;
+    bool (*renderMusicPlayerScreen)(SystemState &state, bool oledOnly, Stream &out) = nullptr;
     bool (*renderWebUploadScreen)(SystemState &state, bool oledOnly, Stream &out) = nullptr;
     bool (*renderPlaceholderApp)(SystemState &state, Stream &out) = nullptr;
 };
@@ -40,6 +41,7 @@ bool appRouterHandleBackInput(
     uint8_t settingsViewWifiSelectList,
     uint8_t settingsViewBluetoothList,
     uint8_t settingsViewBluetoothSelectList,
+    uint8_t settingsViewSdList,
     AppRouterInputContext &context,
     Stream &out);
 

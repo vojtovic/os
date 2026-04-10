@@ -30,6 +30,16 @@ void writeDefaultConfig(const AppConfig &config) {
     file.println(config.sdEnabled ? "true" : "false");
     file.print("sd_probe_speed=");
     file.println(config.sdProbeSpeed);
+    file.print("wifi_ssid=");
+    file.println(config.wifiSsid);
+    file.print("wifi_password=");
+    file.println(config.wifiPassword);
+    file.print("bt_preferred_device=");
+    file.println(config.btPreferredDevice);
+    file.print("bt_preferred_address=");
+    file.println(config.btPreferredAddress);
+    file.print("a2dp_target_name=");
+    file.println(config.a2dpTargetName);
     file.close();
 }
 }  // namespace
@@ -42,6 +52,34 @@ void printConfig(const AppConfig &config, Stream &out) {
     out.println(config.sdEnabled ? "true" : "false");
     out.print("sd_probe_speed: ");
     out.println(config.sdProbeSpeed);
+    out.print("wifi_ssid: ");
+    out.println(config.wifiSsid);
+    out.print("wifi_password: ");
+    if (config.wifiPassword.isEmpty()) {
+        out.println("(empty)");
+    } else {
+        out.print("(saved, len=");
+        out.print(config.wifiPassword.length());
+        out.println(")");
+    }
+    out.print("bt_preferred_device: ");
+    if (config.btPreferredDevice.isEmpty()) {
+        out.println("(empty)");
+    } else {
+        out.println(config.btPreferredDevice);
+    }
+    out.print("bt_preferred_address: ");
+    if (config.btPreferredAddress.isEmpty()) {
+        out.println("(empty)");
+    } else {
+        out.println(config.btPreferredAddress);
+    }
+    out.print("a2dp_target_name: ");
+    if (config.a2dpTargetName.isEmpty()) {
+        out.println("(empty)");
+    } else {
+        out.println(config.a2dpTargetName);
+    }
 }
 
 bool loadConfig(AppConfig &config) {
@@ -78,6 +116,16 @@ bool loadConfig(AppConfig &config) {
             config.sdEnabled = parseBool(value);
         } else if (key == "sd_probe_speed") {
             config.sdProbeSpeed = value.toInt();
+        } else if (key == "wifi_ssid") {
+            config.wifiSsid = value;
+        } else if (key == "wifi_password") {
+            config.wifiPassword = value;
+        } else if (key == "bt_preferred_device") {
+            config.btPreferredDevice = value;
+        } else if (key == "bt_preferred_address") {
+            config.btPreferredAddress = value;
+        } else if (key == "a2dp_target_name") {
+            config.a2dpTargetName = value;
         }
     }
 
@@ -100,6 +148,16 @@ bool saveConfig(const AppConfig &config) {
     file.println(config.sdEnabled ? "true" : "false");
     file.print("sd_probe_speed=");
     file.println(config.sdProbeSpeed);
+    file.print("wifi_ssid=");
+    file.println(config.wifiSsid);
+    file.print("wifi_password=");
+    file.println(config.wifiPassword);
+    file.print("bt_preferred_device=");
+    file.println(config.btPreferredDevice);
+    file.print("bt_preferred_address=");
+    file.println(config.btPreferredAddress);
+    file.print("a2dp_target_name=");
+    file.println(config.a2dpTargetName);
     file.close();
     return true;
 }

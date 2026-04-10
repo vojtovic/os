@@ -8,11 +8,25 @@ struct AppConfig {
     String deviceName = "NoteWave";
     bool sdEnabled = true;
     uint32_t sdProbeSpeed = 4000000;
+    String wifiSsid = "";
+    String wifiPassword = "";
+    String btPreferredDevice = "";
+    String btPreferredAddress = "";
+    String a2dpTargetName = "";
 };
 
 struct LauncherState {
     uint8_t selectedIndex = 0;
     String activeAppId = "desktop";
+};
+
+struct MusicPlayerState {
+    String libraryPath = "/music-player";
+    String statusMessage = "ready";
+    String nowPlaying = "";
+    uint8_t selectedIndex = 0;
+    size_t scrollOffset = 0;
+    bool playing = false;
 };
 
 struct SettingsState {
@@ -31,6 +45,7 @@ struct SettingsState {
     bool btEnabled = false;
     bool btConnected = false;
     String btConnectedDeviceName = "";
+    String btConnectedDeviceAddress = "";
     int8_t selectedBluetoothIndex = -1;
 };
 
@@ -53,12 +68,20 @@ struct NotificationsState {
     uint8_t viewMode = 0;  // 0 hidden, 1 strip, 2 expanded
 };
 
+struct AudioState {
+    bool a2dpActive = false;
+    String a2dpTargetName = "";
+    String statusMessage = "a2dp idle";
+};
+
 struct SystemState {
     AppConfig config;
     LauncherState launcher;
+    MusicPlayerState musicPlayer;
     SettingsState settings;
     FileManagerState fileManager;
     NotificationsState notifications;
+    AudioState audio;
     bool littleFsReady = false;
     bool sdReady = false;
     bool i2cReady = false;

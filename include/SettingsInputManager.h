@@ -12,8 +12,11 @@ struct SettingsInputContext {
     String *wifiSsidList = nullptr;
 
     size_t *bluetoothDeviceCount = nullptr;
+    size_t bluetoothListVisibleCount = 0;
+    size_t *bluetoothListScrollOffset = nullptr;
     bool *bluetoothScanInProgress = nullptr;
     String *bluetoothDeviceList = nullptr;
+    String *bluetoothDeviceAddressList = nullptr;
 
     char *czechComposeDeadKey = nullptr;
 
@@ -23,8 +26,12 @@ struct SettingsInputContext {
     bool (*toggleWifiEnabled)(SystemState &state, Stream &out) = nullptr;
     size_t (*scanWifiNetworks)(Stream &out) = nullptr;
     bool (*connectSelectedWifi)(SystemState &state, Stream &out) = nullptr;
+    bool (*forgetSavedWifi)(SystemState &state, Stream &out) = nullptr;
 
     bool (*toggleBluetoothEnabled)(SystemState &state, Stream &out) = nullptr;
+    bool (*disconnectBluetooth)(SystemState &state, Stream &out) = nullptr;
+    bool (*selectBluetoothDevice)(SystemState &state, const String &deviceName, const String &deviceAddress, int8_t selectedIndex, Stream &out) = nullptr;
+    bool (*forgetSavedBluetoothDevice)(SystemState &state, Stream &out) = nullptr;
     size_t (*scanBluetoothDevices)(Stream &out) = nullptr;
 
     bool (*tryApplyPostfixCzechCompose)(String &buffer, char deadKey) = nullptr;
@@ -45,6 +52,7 @@ bool handleSettingsAppInput(
     uint8_t settingsViewWifiSelectList,
     uint8_t settingsViewBluetoothList,
     uint8_t settingsViewBluetoothSelectList,
+    uint8_t settingsViewSdList,
     uint8_t settingsViewHome,
     SettingsInputContext &context,
     Stream &out);

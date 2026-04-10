@@ -35,6 +35,76 @@ enum CzechDiacritic : uint8_t {
     kDiaRing,
 };
 
+enum BlockGlyph : uint8_t {
+    kBlockNone = 0,
+    kBlockUpperHalf,
+    kBlockLowerHalf,
+    kBlockLeftHalf,
+    kBlockRightHalf,
+    kBlockFull,
+};
+
+bool decodeUtf8BlockGlyph(const char *text, uint8_t &glyph) {
+    glyph = kBlockNone;
+    const uint8_t b0 = static_cast<uint8_t>(text[0]);
+    const uint8_t b1 = static_cast<uint8_t>(text[1]);
+    const uint8_t b2 = static_cast<uint8_t>(text[2]);
+
+    if (b0 != 0xE2 || b1 != 0x96) {
+        return false;
+    }
+
+    if (b2 == 0x80) {
+        glyph = kBlockUpperHalf;  // U+2580
+        return true;
+    }
+    if (b2 == 0x84) {
+        glyph = kBlockLowerHalf;  // U+2584
+        return true;
+    }
+    if (b2 == 0x8C) {
+        glyph = kBlockLeftHalf;  // U+258C
+        return true;
+    }
+    if (b2 == 0x90) {
+        glyph = kBlockRightHalf;  // U+2590
+        return true;
+    }
+    if (b2 == 0x88) {
+        glyph = kBlockFull;  // U+2588
+        return true;
+    }
+
+    return false;
+}
+
+void drawBlockGlyph(Paint *paint, int x, int y, sFONT *font, uint8_t glyph, int colored) {
+    if (glyph == kBlockNone) {
+        return;
+    }
+
+    int startX = x;
+    int endX = x + font->Width - 1;
+    int startY = y;
+    int endY = y + font->Height - 1;
+
+    if (glyph == kBlockUpperHalf) {
+        endY = y + (font->Height / 2) - 1;
+    } else if (glyph == kBlockLowerHalf) {
+        startY = y + (font->Height / 2);
+    } else if (glyph == kBlockLeftHalf) {
+        endX = x + (font->Width / 2) - 1;
+    } else if (glyph == kBlockRightHalf) {
+        startX = x + (font->Width / 2);
+    }
+
+    if (endX < startX || endY < startY) {
+        return;
+    }
+
+    paint->DrawFilledRectangle(startX, startY, endX, endY, colored);
+}
+
 void drawDiacriticMark(Paint *paint, int x, int y, sFONT *font, uint8_t diacritic, int colored) {
     if (diacritic == kDiaNone) {
         return;
@@ -293,6 +363,14 @@ void Paint::DrawStringAtUtf8(int x, int y, const char* text, sFONT* font, int co
     int refcolumn = x;
 
     while (*p_text != 0) {
+        uint8_t blockGlyph = kBlockNone;
+        if (decodeUtf8BlockGlyph(p_text, blockGlyph)) {
+            drawBlockGlyph(this, refcolumn, y, font, blockGlyph, colored);
+            p_text += 3;
+            refcolumn += font->Width;
+            continue;
+        }
+
         char base = '?';
         uint8_t diacritic = kDiaNone;
         if (!decodeUtf8CzechGlyph(p_text, base, diacritic)) {
@@ -302,6 +380,35 @@ void Paint::DrawStringAtUtf8(int x, int y, const char* text, sFONT* font, int co
         DrawCharAt(refcolumn, y, base, font, colored);
         drawDiacriticMark(this, refcolumn, y, font, diacritic, colored);
         refcolumn += font->Width;
+    }
+}
+
+void Paint::DrawStringAtUtf8Compact(int x, int y, const char* text, sFONT* font, int colored, int glyphAdvance) {
+    if (glyphAdvance <= 0) {
+        glyphAdvance = font->Width;
+    }
+
+    const char* p_text = text;
+    int refcolumn = x;
+
+    while (*p_text != 0) {
+        uint8_t blockGlyph = kBlockNone;
+        if (decodeUtf8BlockGlyph(p_text, blockGlyph)) {
+            drawBlockGlyph(this, refcolumn, y, font, blockGlyph, colored);
+            p_text += 3;
+            refcolumn += glyphAdvance;
+            continue;
+        }
+
+        char base = '?';
+        uint8_t diacritic = kDiaNone;
+        if (!decodeUtf8CzechGlyph(p_text, base, diacritic)) {
+            break;
+        }
+
+        DrawCharAt(refcolumn, y, base, font, colored);
+        drawDiacriticMark(this, refcolumn, y, font, diacritic, colored);
+        refcolumn += glyphAdvance;
     }
 }
 

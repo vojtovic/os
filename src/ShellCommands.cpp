@@ -1,5 +1,6 @@
 #include "ShellCommands.h"
 
+#include "AudioManager.h"
 #include "DisplayManager.h"
 #include "HardwareManager.h"
 #include "WebUploadManager.h"
@@ -13,6 +14,7 @@ String trimCopy(String value) {
 constexpr const char *kLauncherAppIds[] = {
     "settings",
     "file-manager",
+    "music-player",
     "web-upload",
     "apps",
     "serial",
@@ -108,6 +110,37 @@ void handleWebUploadCommand(SystemState &state, const String &args, Stream &out)
 
     out.println("Web upload: unknown subcommand");
 }
+
+void handleA2dpCommand(SystemState &state, const String &args, Stream &out) {
+    if (args.isEmpty() || args == "status") {
+        printA2dpStatus(state, out);
+        return;
+    }
+
+    if (args == "stop") {
+        stopA2dpSource(state, out);
+        return;
+    }
+
+    if (args.startsWith("start")) {
+        String target = args.length() > 5 ? trimCopy(args.substring(5)) : String("");
+        if (target.isEmpty()) {
+            target = state.config.a2dpTargetName;
+        }
+        if (target.isEmpty()) {
+            out.println("A2DP: missing target; use a2dp start <bt-name>");
+            return;
+        }
+
+        if (startA2dpSource(state, target, out)) {
+            // Persist target name for future starts.
+            saveConfig(state.config);
+        }
+        return;
+    }
+
+    out.println("A2DP: unknown subcommand");
+}
 }  // namespace
 
 void printShellHelp(Stream &out) {
@@ -126,12 +159,13 @@ void printShellHelp(Stream &out) {
     out.println("config set sd on|off");
     out.println("config set sd_speed <hz>");
     out.println("web-upload status|start|stop");
+    out.println("a2dp status|start <bt-name>|stop");
     out.println("display info");
     out.println("launcher show");
     out.println("launcher next");
     out.println("launcher prev");
     out.println("launcher refresh");
-    out.println("launcher open <settings|file-manager|web-upload|apps|serial|about>");
+    out.println("launcher open <settings|file-manager|music-player|web-upload|apps|serial|about>");
     out.println("launcher list");
     out.println("settings show");
     out.println("oled test");
@@ -208,6 +242,12 @@ bool executeShellCommand(SystemState &state, TaskManager &taskManager, const Str
     if (line.startsWith("web-upload")) {
         String args = line.length() > 10 ? trimCopy(line.substring(10)) : String("");
         handleWebUploadCommand(state, args, out);
+        return true;
+    }
+
+    if (line.startsWith("a2dp")) {
+        String args = line.length() > 4 ? trimCopy(line.substring(4)) : String("");
+        handleA2dpCommand(state, args, out);
         return true;
     }
 
