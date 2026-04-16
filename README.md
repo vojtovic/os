@@ -119,7 +119,7 @@ Modes and controls:
 - Tab or Esc: switch read/write mode
 - right arrow: save note
 - left arrow: global back navigation
-- up/down arrows: cycle active tag filter
+- up/down arrows: scroll text viewport
 
 Supported markdown and Obsidian-style constructs in read preview:
 
@@ -136,6 +136,92 @@ Supported markdown and Obsidian-style constructs in read preview:
 - embeds (`![[File]]`)
 - markdown links (`[text](url)`)
 - in-note hashtag tags for filtering (`#tag`)
+
+### Implemented Syntax Cheat Sheet
+
+You can use the following syntax directly in Notes. These forms are parsed in read preview and are compatible with Obsidian workflows.
+
+Headings:
+
+```md
+# Heading 1
+## Heading 2
+### Heading 3
+#### Heading 4
+##### Heading 5
+###### Heading 6
+```
+
+Unordered lists:
+
+```md
+- item
+* item
++ item
+```
+
+Ordered lists:
+
+```md
+1. first
+2) second
+```
+
+Task lists:
+
+```md
+- [ ] todo
+- [x] done
+```
+
+Quotes and callouts:
+
+```md
+> quote line
+> [!note] callout title
+```
+
+Horizontal rules:
+
+```md
+---
+***
+___
+```
+
+Code fences:
+
+````md
+```cpp
+int x = 1;
+```
+
+~~~
+plain block
+~~~
+````
+
+Internal links and embeds:
+
+```md
+[[My Note]]
+[[My Note|Custom Label]]
+![[Image.png]]
+```
+
+Markdown links:
+
+```md
+[Obsidian](https://obsidian.md)
+```
+
+Tags:
+
+```md
+#todo
+#projekt/esp32
+#čtení
+```
 
 Practical interoperability goal:
 

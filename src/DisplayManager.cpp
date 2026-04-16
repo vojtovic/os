@@ -87,6 +87,15 @@ size_t gNotesTagCount = 0;
 constexpr size_t kNotesMaxLinks = 16;
 String gNotesLinks[kNotesMaxLinks];
 size_t gNotesLinkCount = 0;
+constexpr size_t kNotesVisibleLinesOled = 4;
+constexpr size_t kNotesVisibleLinesEink = 9;
+size_t gNotesScrollLine = 0;
+bool gNotesEinkDirty = true;
+uint32_t gNotesLastEinkRenderMs = 0;
+uint32_t gNotesLastViewportSignature = 0;
+uint8_t gNotesScrollBatchSteps = 0;
+constexpr uint8_t kNotesScrollBatchThreshold = 2;
+constexpr uint32_t kNotesScrollBatchTimeoutMs = 320;
 constexpr int kNotesTagFilterAll = -1;
 int gNotesActiveTagIndex = kNotesTagFilterAll;
 uint32_t gLastDisplayActivityMs = 0;
@@ -159,15 +168,34 @@ bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out);
 String notesTailPreview(size_t maxChars);
 String notesStyledPreviewForActiveFilter(size_t maxChars);
 String notesLinksSummary(size_t maxChars);
+String notesActiveTagVisual(size_t maxChars);
+bool isNotesEnterKey(char normalizedKey, uint8_t rawCode);
+String notesLineFromEnd(const String &text, size_t fromEnd);
+String notesClipLine(const String &line, size_t maxChars);
+String notesComposeDisplayText(bool writeMode);
+size_t notesCountLines(const String &text);
+String notesLineAt(const String &text, size_t lineIndex);
+size_t notesMaxScrollLine(const String &text, size_t visibleLines);
+void notesScrollToTail(bool writeMode);
+uint32_t notesViewportSignature(const String &displayText, bool writeMode, size_t scrollLine);
+uint8_t notesHeadingLevel(const String &line);
+String notesStripHeadingMarkup(const String &line, uint8_t level);
+bool notesFindLastHeading(const String &text, String &headingLine, uint8_t &headingLevel);
 String normalizedNotesPath(SystemState &state);
 String normalizeMarkdownText(const String &raw);
 bool isOrderedListPrefix(const String &line);
 
 bool isNotesTagChar(char ch) {
+    const uint8_t u = static_cast<uint8_t>(ch);
+    // Allow UTF-8 bytes so Czech/non-ASCII tags are detected from Obsidian files.
+    if (u >= 0x80) {
+        return true;
+    }
+
     return (ch >= 'a' && ch <= 'z') ||
            (ch >= 'A' && ch <= 'Z') ||
            (ch >= '0' && ch <= '9') ||
-           ch == '_' || ch == '-';
+           ch == '_' || ch == '-' || ch == '/';
 }
 
 void clearNotesTags() {
@@ -341,6 +369,205 @@ String notesFilterLabel() {
         return String("filter: all");
     }
     return String("filter: ") + active;
+}
+
+String notesActiveTagVisual(size_t maxChars) {
+    const String active = notesActiveTag();
+    String text;
+    if (active.isEmpty()) {
+        text = String("ACTIVE TAG: ALL (") + String(static_cast<unsigned>(gNotesTagCount)) + String(")");
+    } else {
+        text = String("ACTIVE TAG: ") + active;
+    }
+
+    if (text.length() <= maxChars) {
+        return text;
+    }
+    return text.substring(0, maxChars - 3) + String("...");
+}
+
+bool isNotesEnterKey(char normalizedKey, uint8_t rawCode) {
+    if (normalizedKey == '\r' || normalizedKey == '\n') {
+        return true;
+    }
+
+    const uint8_t stripped = static_cast<uint8_t>(rawCode & 0x7F);
+    return stripped == '\r' || stripped == '\n';
+}
+
+String notesLineFromEnd(const String &text, size_t fromEnd) {
+    if (text.isEmpty()) {
+        return String();
+    }
+
+    int end = static_cast<int>(text.length());
+    while (end > 0 && text[end - 1] == '\n') {
+        --end;
+    }
+
+    if (end <= 0) {
+        return String();
+    }
+
+    for (size_t i = 0; i < fromEnd; ++i) {
+        const int prevBreak = text.lastIndexOf('\n', end - 1);
+        if (prevBreak < 0) {
+            return String();
+        }
+        end = prevBreak;
+        while (end > 0 && text[end - 1] == '\n') {
+            --end;
+        }
+        if (end <= 0) {
+            return String();
+        }
+    }
+
+    const int startBreak = text.lastIndexOf('\n', end - 1);
+    const int start = startBreak < 0 ? 0 : startBreak + 1;
+    return text.substring(start, end);
+}
+
+String notesClipLine(const String &line, size_t maxChars) {
+    if (line.length() <= maxChars) {
+        return line;
+    }
+    return line.substring(0, maxChars - 3) + String("...");
+}
+
+String notesComposeDisplayText(bool writeMode) {
+    String text = gNotesBuffer;
+    if (writeMode && !gNotesDraftWord.isEmpty()) {
+        text += gNotesDraftWord;
+    }
+    return text;
+}
+
+size_t notesCountLines(const String &text) {
+    if (text.isEmpty()) {
+        return 1;
+    }
+
+    size_t lines = 1;
+    for (size_t i = 0; i < text.length(); ++i) {
+        if (text[i] == '\n') {
+            ++lines;
+        }
+    }
+    return lines;
+}
+
+String notesLineAt(const String &text, size_t lineIndex) {
+    if (text.isEmpty()) {
+        return lineIndex == 0 ? String() : String();
+    }
+
+    size_t currentLine = 0;
+    int start = 0;
+    const int len = static_cast<int>(text.length());
+    for (int i = 0; i <= len; ++i) {
+        const bool atBreak = (i == len) || (text[i] == '\n');
+        if (!atBreak) {
+            continue;
+        }
+
+        if (currentLine == lineIndex) {
+            return text.substring(start, i);
+        }
+
+        ++currentLine;
+        start = i + 1;
+    }
+
+    return String();
+}
+
+size_t notesMaxScrollLine(const String &text, size_t visibleLines) {
+    const size_t totalLines = notesCountLines(text);
+    if (totalLines <= visibleLines) {
+        return 0;
+    }
+    return totalLines - visibleLines;
+}
+
+void notesScrollToTail(bool writeMode) {
+    const String text = notesComposeDisplayText(writeMode);
+    gNotesScrollLine = notesMaxScrollLine(text, kNotesVisibleLinesEink);
+}
+
+uint32_t notesViewportSignature(const String &displayText, bool writeMode, size_t scrollLine) {
+    uint32_t hash = 2166136261u;
+    hash ^= static_cast<uint32_t>(writeMode ? 1 : 0);
+    hash *= 16777619u;
+    hash ^= static_cast<uint32_t>(scrollLine & 0xFFFFu);
+    hash *= 16777619u;
+
+    for (size_t i = 0; i < kNotesVisibleLinesEink; ++i) {
+        String line = notesLineAt(displayText, scrollLine + i);
+        for (size_t j = 0; j < line.length(); ++j) {
+            hash ^= static_cast<uint8_t>(line[j]);
+            hash *= 16777619u;
+        }
+        hash ^= 0xFFu;
+        hash *= 16777619u;
+    }
+
+    return hash;
+}
+
+uint8_t notesHeadingLevel(const String &line) {
+    String trimmed = line;
+    trimmed.trim();
+    if (trimmed.startsWith("###### ")) return 6;
+    if (trimmed.startsWith("##### ")) return 5;
+    if (trimmed.startsWith("#### ")) return 4;
+    if (trimmed.startsWith("### ")) return 3;
+    if (trimmed.startsWith("## ")) return 2;
+    if (trimmed.startsWith("# ")) return 1;
+    return 0;
+}
+
+String notesStripHeadingMarkup(const String &line, uint8_t level) {
+    if (level == 0) {
+        return line;
+    }
+
+    String trimmed = line;
+    trimmed.trim();
+    const size_t prefixLen = static_cast<size_t>(level) + 1;
+    if (trimmed.length() > prefixLen) {
+        return trimmed.substring(prefixLen);
+    }
+    return String();
+}
+
+bool notesFindLastHeading(const String &text, String &headingLine, uint8_t &headingLevel) {
+    headingLine = "";
+    headingLevel = 0;
+
+    if (text.isEmpty()) {
+        return false;
+    }
+
+    const size_t maxProbeLines = 200;
+    for (size_t offset = 0; offset < maxProbeLines; ++offset) {
+        String candidate = notesLineFromEnd(text, offset);
+        if (candidate.isEmpty()) {
+            break;
+        }
+
+        const uint8_t level = notesHeadingLevel(candidate);
+        if (level == 0) {
+            continue;
+        }
+
+        headingLevel = level;
+        headingLine = notesStripHeadingMarkup(candidate, level);
+        headingLine.trim();
+        return true;
+    }
+
+    return false;
 }
 
 bool notesLineContainsTag(const String &line, const String &tag) {
@@ -636,6 +863,8 @@ bool ensureNotesLoaded(SystemState &state, Stream &out) {
     state.notes.statusMessage = "loaded";
     state.notes.dirty = false;
     refreshNotesMetadataFromBuffer();
+    notesScrollToTail(state.notes.viewMode == kNotesViewWrite);
+    gNotesEinkDirty = true;
     return true;
 }
 
@@ -665,6 +894,7 @@ bool saveNotes(SystemState &state, Stream &out) {
     file.close();
     state.notes.dirty = false;
     state.notes.statusMessage = "saved";
+    gNotesEinkDirty = true;
     out.print("Notes: saved ");
     out.println(path);
     return true;
@@ -2968,6 +3198,9 @@ void resetNotesSession(SystemState &state) {
     state.notes.dirty = false;
     state.notes.statusMessage = "ready";
     state.notes.viewMode = kNotesViewWrite;
+    gNotesScrollLine = 0;
+    gNotesScrollBatchSteps = 0;
+    gNotesEinkDirty = true;
     gNotesDraftWord = "";
     clearNotesTags();
     clearNotesLinks();
@@ -2982,10 +3215,13 @@ bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode
         if (state.notes.viewMode == kNotesViewRead) {
             state.notes.viewMode = kNotesViewWrite;
             state.notes.statusMessage = "mode: write";
+            notesScrollToTail(true);
         } else {
             state.notes.viewMode = kNotesViewRead;
             state.notes.statusMessage = "mode: read";
         }
+        gNotesEinkDirty = true;
+        gNotesScrollBatchSteps = 0;
         refreshEink = true;
         return true;
     }
@@ -3000,40 +3236,38 @@ bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode
         commitNotesDraftWord(state, false);
         saveNotes(state, out);
         refreshNotesMetadataFromBuffer();
+        gNotesEinkDirty = true;
+        gNotesScrollBatchSteps = 0;
         refreshEink = true;
         return true;
     }
 
     if (isCardKbUpArrowCode(rawCode) || isCardKbDownArrowCode(rawCode)) {
-        if (gNotesTagCount == 0) {
-            gNotesActiveTagIndex = kNotesTagFilterAll;
-            state.notes.statusMessage = "no tags";
-            return true;
-        }
-
+        const String displayText = notesComposeDisplayText(writeMode);
+        const size_t maxScroll = notesMaxScrollLine(displayText, kNotesVisibleLinesEink);
         const bool isUp = isCardKbUpArrowCode(rawCode);
+        const size_t before = gNotesScrollLine;
+
         if (isUp) {
-            if (gNotesActiveTagIndex == kNotesTagFilterAll) {
-                gNotesActiveTagIndex = static_cast<int>(gNotesTagCount) - 1;
-            } else {
-                --gNotesActiveTagIndex;
-                if (gNotesActiveTagIndex < 0) {
-                    gNotesActiveTagIndex = kNotesTagFilterAll;
-                }
+            if (gNotesScrollLine > 0) {
+                --gNotesScrollLine;
             }
-        } else {
-            if (gNotesActiveTagIndex == kNotesTagFilterAll) {
-                gNotesActiveTagIndex = 0;
-            } else {
-                ++gNotesActiveTagIndex;
-                if (gNotesActiveTagIndex >= static_cast<int>(gNotesTagCount)) {
-                    gNotesActiveTagIndex = kNotesTagFilterAll;
-                }
-            }
+        } else if (gNotesScrollLine < maxScroll) {
+            ++gNotesScrollLine;
         }
 
-        state.notes.statusMessage = notesFilterLabel();
-        refreshEink = true;
+        state.notes.statusMessage = String("scroll ") + String(static_cast<unsigned>(gNotesScrollLine + 1)) + String("/") + String(static_cast<unsigned>(maxScroll + 1));
+        if (gNotesScrollLine != before) {
+            ++gNotesScrollBatchSteps;
+            const uint32_t nowMs = millis();
+            const bool thresholdReached = gNotesScrollBatchSteps >= kNotesScrollBatchThreshold;
+            const bool timeoutReached = (nowMs - gNotesLastEinkRenderMs) >= kNotesScrollBatchTimeoutMs;
+            if (thresholdReached || timeoutReached) {
+                refreshEink = true;
+                gNotesEinkDirty = true;
+                gNotesScrollBatchSteps = 0;
+            }
+        }
         return true;
     }
 
@@ -3047,12 +3281,16 @@ bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode
     if (normalizedKey == 8) {
         if (!gNotesDraftWord.isEmpty()) {
             gNotesDraftWord.remove(gNotesDraftWord.length() - 1);
-            state.notes.statusMessage = gNotesDraftWord.startsWith("#") ? "typing tag" : "typing";
+            state.notes.statusMessage = "typing";
+            notesScrollToTail(writeMode);
+            gNotesEinkDirty = true;
         } else if (!gNotesBuffer.isEmpty()) {
             gNotesBuffer.remove(gNotesBuffer.length() - 1);
             state.notes.dirty = true;
             state.notes.statusMessage = "edited";
             refreshNotesMetadataFromBuffer();
+            notesScrollToTail(writeMode);
+            gNotesEinkDirty = true;
             refreshEink = true;
         }
         return true;
@@ -3061,6 +3299,8 @@ bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode
     if (normalizedKey == ' ') {
         if (commitNotesDraftWord(state, true)) {
             state.notes.statusMessage = "word committed";
+            notesScrollToTail(writeMode);
+            gNotesEinkDirty = true;
             refreshEink = true;
             return true;
         }
@@ -3069,12 +3309,14 @@ bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode
         return true;
     }
 
-    if (normalizedKey == '\r' || normalizedKey == '\n') {
+    if (isNotesEnterKey(normalizedKey, rawCode)) {
         bool committed = commitNotesDraftWord(state, false);
         if (gNotesBuffer.length() < kNotesMaxChars) {
             gNotesBuffer += '\n';
             state.notes.dirty = true;
             state.notes.statusMessage = committed ? "line committed" : "new line";
+            notesScrollToTail(writeMode);
+            gNotesEinkDirty = true;
             refreshEink = true;
         } else {
             state.notes.statusMessage = "note full";
@@ -3085,7 +3327,9 @@ bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode
     if (normalizedKey >= 32 && normalizedKey <= 126 && normalizedKey != ' ') {
         if (notesTotalChars() < kNotesMaxChars) {
             gNotesDraftWord += normalizedKey;
-            state.notes.statusMessage = gNotesDraftWord.startsWith("#") ? "typing tag" : "typing";
+            state.notes.statusMessage = "typing";
+            notesScrollToTail(writeMode);
+            gNotesEinkDirty = true;
         } else {
             state.notes.statusMessage = "note full";
         }
@@ -3118,22 +3362,80 @@ bool renderMusicPlayerScreen(SystemState &state, bool oledOnly, Stream &out) {
 bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out) {
     ensureNotesLoaded(state, out);
     const bool writeMode = state.notes.viewMode == kNotesViewWrite;
-    const String modeLine = writeMode ? String("mode: write") : String("mode: read");
+    const String modeLine = writeMode ? String("WRITE") : String("READ");
+    const String displayText = notesComposeDisplayText(writeMode);
+    const size_t totalLines = notesCountLines(displayText);
+    const size_t maxScroll = notesMaxScrollLine(displayText, kNotesVisibleLinesEink);
+    if (gNotesScrollLine > maxScroll) {
+        gNotesScrollLine = maxScroll;
+    }
 
     if (state.oledReady && state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        String charsLine = String("chars: ") + String(static_cast<unsigned>(notesTotalChars())) + (state.notes.dirty ? " *" : "");
-        String tagsLine = notesTagsSummary(24);
-        String linksLine = notesLinksSummary(24);
-        String filterLine = notesFilterLabel();
-
         gOled.clearBuffer();
         gOled.setFont(u8g2_font_6x10_tf);
-        gOled.drawStr(0, 10, "NOTES");
-        gOled.drawStr(0, 20, modeLine.c_str());
-        gOled.drawStr(0, 30, charsLine.c_str());
-        gOled.drawStr(0, 40, state.notes.statusMessage.c_str());
-        gOled.drawStr(0, 50, filterLine.c_str());
-        gOled.drawStr(0, 60, writeMode ? tagsLine.c_str() : linksLine.c_str());
+        gOled.drawFrame(0, 0, 128, 64);
+        gOled.drawLine(0, 13, 127, 13);
+
+        if (writeMode) {
+            const String writeText = notesComposeDisplayText(true);
+            const size_t writeTotalLines = notesCountLines(writeText);
+            const size_t startLine = writeTotalLines > kNotesVisibleLinesOled ? (writeTotalLines - kNotesVisibleLinesOled) : 0;
+            const size_t cursorLine = writeTotalLines == 0 ? 0 : (writeTotalLines - 1);
+
+            String headLine = "NOTES WRITE";
+            String posLine = String("L") + String(static_cast<unsigned>(cursorLine + 1));
+            gOled.drawStr(3, 10, headLine.c_str());
+            gOled.drawStr(104, 10, posLine.c_str());
+
+            String statusShort = notesClipLine(state.notes.statusMessage, 20);
+            gOled.drawStr(3, 21, statusShort.c_str());
+
+            gOled.drawFrame(2, 24, 124, 38);
+            for (size_t i = 0; i < kNotesVisibleLinesOled; ++i) {
+                const size_t lineIndex = startLine + i;
+                String line = notesLineAt(writeText, lineIndex);
+                line = notesClipLine(line.isEmpty() ? String(" ") : line, 19);
+                if (lineIndex == cursorLine) {
+                    line += "_";
+                }
+
+                const int y = 33 + static_cast<int>(i) * 9;
+                gOled.drawStr(5, y, line.c_str());
+            }
+        } else {
+            String headLine = String("NOTES ") + modeLine;
+            String posLine = String(static_cast<unsigned>(gNotesScrollLine + 1)) + String("/") + String(static_cast<unsigned>(totalLines));
+            const size_t oledMaxScroll = notesMaxScrollLine(displayText, kNotesVisibleLinesOled);
+
+            gOled.drawStr(3, 10, headLine.c_str());
+            gOled.drawStr(98, 10, posLine.c_str());
+
+            String statusShort = notesClipLine(state.notes.statusMessage, 20);
+            gOled.drawStr(3, 21, statusShort.c_str());
+
+            gOled.drawFrame(2, 24, 118, 38);
+            for (size_t i = 0; i < kNotesVisibleLinesOled; ++i) {
+                const size_t lineIndex = gNotesScrollLine + i;
+                String line = notesLineAt(displayText, lineIndex);
+                line = notesStyleLineForBrowse(line);
+                line = notesClipLine(line.isEmpty() ? String(" ") : line, 18);
+                const int y = 33 + static_cast<int>(i) * 9;
+                gOled.drawStr(5, y, line.c_str());
+            }
+
+            // Slim scrollbar for read-mode orientation.
+            const int barX = 123;
+            const int barY = 24;
+            const int barH = 38;
+            gOled.drawFrame(barX, barY, 3, barH);
+            const int thumbH = 6;
+            int thumbY = barY + 1;
+            if (oledMaxScroll > 0) {
+                thumbY = barY + 1 + static_cast<int>(((barH - 2 - thumbH) * gNotesScrollLine) / oledMaxScroll);
+            }
+            gOled.drawBox(barX + 1, thumbY, 1, thumbH);
+        }
+
         gOled.sendBuffer();
         xSemaphoreGive(state.spiMutex);
     }
@@ -3146,36 +3448,83 @@ bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out) {
         return state.oledReady;
     }
 
+    const uint32_t viewportSig = notesViewportSignature(displayText, writeMode, gNotesScrollLine);
+    if (!gNotesEinkDirty && viewportSig == gNotesLastViewportSignature) {
+        noteDisplayActivity();
+        return true;
+    }
+
     if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
         Paint paint(gEinkBuffer, kEinkNativeWidth, kEinkNativeHeight);
         prepareLandscapePaint(paint);
         paint.Clear(kUncolored);
         paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
-        paint.DrawStringAt(8, 10, "NOTES", &Font16, kColored);
 
-        String metaLine = modeLine + String(" chars:") + String(static_cast<unsigned>(gNotesBuffer.length())) +
-                          (state.notes.dirty ? " *" : "") +
-                          String(" status:") + state.notes.statusMessage;
-        paint.DrawStringAt(8, 28, metaLine.c_str(), &Font12, kColored);
-        paint.DrawLine(0, 40, kEinkLandscapeWidth - 1, 40, kColored);
+        String topLine = String("NOTES ") + modeLine;
+        String posLine = String("line ") + String(static_cast<unsigned>(gNotesScrollLine + 1)) + String("/") + String(static_cast<unsigned>(totalLines));
+        String statusLine = notesClipLine(state.notes.statusMessage, 62);
+        paint.DrawStringAtUtf8(8, 12, topLine.c_str(), &Font16, kColored);
+        paint.DrawStringAtUtf8(188, 12, posLine.c_str(), &Font12, kColored);
+        paint.DrawLine(0, 20, kEinkLandscapeWidth - 1, 20, kColored);
+        paint.DrawStringAtUtf8(8, 34, statusLine.c_str(), &Font12, kColored);
 
-        // Tags are rendered in their own boxed area so they stand out from note text.
-        paint.DrawRectangle(8, 48, kEinkLandscapeWidth - 8, 78, kColored);
-        paint.DrawStringAt(12, 62, "TAGS", &Font12, kColored);
-        String tagsLine = notesTagsSummary(40);
-        paint.DrawStringAtUtf8(56, 62, tagsLine.c_str(), &Font12, kColored);
-        paint.DrawStringAtUtf8(8, 82, notesFilterLabel().c_str(), &Font12, kColored);
+        const int textLeft = 8;
+        const int textTop = 42;
+        const int textRight = kEinkLandscapeWidth - 18;
+        const int textBottom = 196;
+        paint.DrawRectangle(textLeft - 2, textTop - 4, textRight + 2, textBottom, kColored);
 
-        String linksLine = notesLinksSummary(46);
-        String previewLine = writeMode ? notesPreviewForActiveFilter(46) : notesStyledPreviewForActiveFilter(46);
-        previewLine.replace("\n", " ");
-        paint.DrawStringAtUtf8(8, 98, linksLine.c_str(), &Font12, kColored);
-        paint.DrawStringAt(8, 112, writeMode ? "WRITE" : "READ", &Font12, kColored);
-        paint.DrawStringAtUtf8(66, 112, previewLine.c_str(), &Font12, kColored);
-        paint.DrawStringAt(8, 126, "up/down=tag  tab/esc=read/write", &Font12, kColored);
+        int y = 56;
+        const int textInnerBottom = textBottom - 4;
+        const size_t cursorLineIndex = writeMode ? (totalLines == 0 ? 0 : totalLines - 1) : 0;
+        for (size_t i = 0; i < kNotesVisibleLinesEink && y <= 186; ++i) {
+            const size_t lineIndex = gNotesScrollLine + i;
+            String line = notesLineAt(displayText, lineIndex);
+            const uint8_t level = writeMode ? 0 : notesHeadingLevel(line);
+            if (!writeMode) {
+                line = notesStyleLineForBrowse(line);
+            }
+            const bool largeHeading = !writeMode && level > 0 && level <= 2;
+            const int lineAdvance = largeHeading ? 20 : 16;
+            if (y + lineAdvance > textInnerBottom) {
+                break;
+            }
+
+            line = notesClipLine(line.isEmpty() ? String(" ") : line, largeHeading ? 42 : 52);
+            if (writeMode && lineIndex == cursorLineIndex) {
+                line += "_";
+            }
+
+            if (largeHeading) {
+                paint.DrawStringAtUtf8(textLeft, y, line.c_str(), &Font16, kColored);
+            } else {
+                paint.DrawStringAtUtf8(textLeft, y, line.c_str(), &Font12, kColored);
+            }
+
+            y += lineAdvance;
+        }
+
+        // Right-side scrollbar.
+        const int sbX = kEinkLandscapeWidth - 12;
+        const int sbY = textTop;
+        const int sbH = textBottom - textTop - 4;
+        paint.DrawRectangle(sbX, sbY, sbX + 6, sbY + sbH, kColored);
+        int sbThumbY = sbY + 2;
+        const int sbThumbH = 12;
+        if (maxScroll > 0) {
+            sbThumbY = sbY + 2 + static_cast<int>(((sbH - 4 - sbThumbH) * gNotesScrollLine) / maxScroll);
+        }
+        paint.DrawRectangle(sbX + 1, sbThumbY, sbX + 5, sbThumbY + sbThumbH, kColored);
+
+        paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
+        paint.DrawStringAt(8, 220, "up/down=scroll enter=new line ->=save", &Font12, kColored);
+        paint.DrawStringAt(8, 236, "tab/esc=read/write <- back", &Font12, kColored);
 
         gEink.display(paint.GetImage());
         refreshEinkWithCadence(false);
+        gNotesLastViewportSignature = viewportSig;
+        gNotesLastEinkRenderMs = millis();
+        gNotesEinkDirty = false;
         xSemaphoreGive(state.spiMutex);
     }
 

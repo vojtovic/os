@@ -301,6 +301,53 @@ Use this file as the shared context between agents in this workspace.
 - Build: done, evidence: updated `README.md` with current shell commands, implemented app capabilities, Notes read/write + Obsidian compatibility, and known Bluetooth/A2DP limitations, next stage: review.
 - Review: done, evidence: README now reflects actual runtime behavior and near-term roadmap without changing firmware code paths, next stage: explain.
 
+## Stage Status (Notes Tags Functional + Visual Fix)
+- Strategy: done, evidence: user reported tags still seem to do nothing, next stage: build.
+- Build: done, evidence: expanded tag parser to accept UTF-8/Czech bytes and slash (`/`) and added stronger active-tag rendering (dedicated active tag line + larger e-ink font), next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after tag parser/render patch, next stage: review.
+- Review: done, evidence: existing controls (`up/down` tag cycling, `->` save, `<-` back, read/write mode switch) remain unchanged while tag visibility and recognition improved, next stage: explain.
+
+## Stage Status (Notes Newline + Heading Readability)
+- Strategy: done, evidence: user clarified priority is Obsidian-like headings and real multiline writing over tag mechanics, next stage: build.
+- Build: done, evidence: added robust enter detection (`normalized` + high-bit stripped raw variants), replaced single-line preview flattening with two-line last-lines rendering, and updated on-screen notes hint to `enter=new line`, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after multiline/preview patch, next stage: review.
+- Review: done, evidence: read/write switching and save/back behavior remain intact while line breaks are now visible in Notes preview and input path, next stage: explain.
+
+## Stage Status (Notes Read Mode Heading Render Visibility)
+- Strategy: done, evidence: user reported read mode still appears to only change label and not heading rendering, next stage: build.
+- Build: done, evidence: read mode now explicitly finds the last heading in the entire note and renders a visible heading badge (`H1..H6`) with stronger font hierarchy on OLED/e-ink, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after read-mode heading visibility patch, next stage: review.
+- Review: done, evidence: write/read toggle and multiline entry behavior remain unchanged while read mode now always surfaces heading detection from note content, next stage: explain.
+
+## Stage Status (Notes Larger Text Field + Scroll Input)
+- Strategy: done, evidence: user requested larger text area, up/down scrolling instead of active-tag behavior, and live e-ink writing visibility, next stage: build.
+- Build: done, evidence: replaced tag-focused Notes layout with multi-line text viewport on OLED/e-ink, mapped up/down to line scrolling, kept enter as newline and right-arrow as save, and made e-ink render current writing viewport directly, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after viewport/scroll patch set, next stage: review.
+- Review: done, evidence: read/write switching and back/save controls remain intact while text visibility and navigation are now content-first instead of tag-first, next stage: explain.
+
+## Stage Status (Notes UI Visual Polish)
+- Strategy: done, evidence: user requested making the Notes screen visually cleaner after functional fixes, next stage: build.
+- Build: done, evidence: refined OLED/e-ink Notes layouts with framed content area, compact top bar, truncated status line, and visible scrollbars while keeping behavior unchanged, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after visual-polish patch, next stage: review.
+- Review: done, evidence: input flow (up/down scroll, enter newline, right save, left back, tab/esc mode switch) remains stable with improved readability and orientation, next stage: explain.
+
+## Stage Status (Notes E-ink Stability Optimization)
+- Strategy: done, evidence: user reported multiple e-ink Notes issues and requested focused optimization, next stage: build.
+- Build: done, evidence: hardened e-ink Notes line renderer with overflow guards, font-aware clipping widths, and write-mode cursor marker in the e-ink viewport, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after e-ink stabilization patch, next stage: review.
+- Review: done, evidence: e-ink line drawing no longer risks overlapping footer/text frame with mixed heading fonts; write-mode current-line visibility improved, next stage: explain.
+
+## Stage Status (Notes E-ink Refresh Optimization)
+- Strategy: done, evidence: user requested additional optimization steps for e-ink notes performance, next stage: build.
+- Build: done, evidence: implemented viewport-signature dirty guard to skip redundant e-ink redraws and added batched scroll refresh (threshold + timeout) to reduce refresh load during rapid up/down scrolling, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after e-ink refresh optimization patch, next stage: review.
+- Review: done, evidence: scroll interaction remains responsive while unnecessary full Notes e-ink redraws are avoided when content/viewport is unchanged, next stage: explain.
+
+## Stage Status (README Syntax Reference)
+- Strategy: done, evidence: user requested README to list all implemented note-markup tags/signs, next stage: build.
+- Build: done, evidence: updated `README.md` controls section to current up/down scroll behavior and added explicit markdown/Obsidian syntax cheat sheet with examples (headings, lists, tasks, callouts, hr, code fences, links, embeds, tags), next stage: review.
+- Review: done, evidence: README now documents practical syntax forms users can type directly and expect to preview in Notes, next stage: explain.
+
 ## Stage Status (Bluetooth Completion)
 - Strategy: done, evidence: user requested finishing Bluetooth after WiFi completion, next stage: ideas.
 - Ideas: done, evidence: selected low-risk persistence + forget flow (no new background pairing logic), next stage: build.
