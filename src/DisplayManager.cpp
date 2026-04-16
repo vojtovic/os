@@ -79,9 +79,16 @@ bool gMusicCachePrimed = false;
 constexpr size_t kNotesMaxChars = 1200;
 String gNotesBuffer;
 String gNotesDraftWord;
+constexpr uint8_t kNotesViewRead = 0;
+constexpr uint8_t kNotesViewWrite = 1;
 constexpr size_t kNotesMaxTags = 16;
 String gNotesTags[kNotesMaxTags];
 size_t gNotesTagCount = 0;
+constexpr size_t kNotesMaxLinks = 16;
+String gNotesLinks[kNotesMaxLinks];
+size_t gNotesLinkCount = 0;
+constexpr int kNotesTagFilterAll = -1;
+int gNotesActiveTagIndex = kNotesTagFilterAll;
 uint32_t gLastDisplayActivityMs = 0;
 bool gEinkSleeping = false;
 bool gOledSleeping = false;
@@ -149,6 +156,12 @@ bool renderMusicPlayerScreen(SystemState &state, bool oledOnly, Stream &out);
 void resetNotesSession(SystemState &state);
 bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode, bool &refreshEink, Stream &out);
 bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out);
+String notesTailPreview(size_t maxChars);
+String notesStyledPreviewForActiveFilter(size_t maxChars);
+String notesLinksSummary(size_t maxChars);
+String normalizedNotesPath(SystemState &state);
+String normalizeMarkdownText(const String &raw);
+bool isOrderedListPrefix(const String &line);
 
 bool isNotesTagChar(char ch) {
     return (ch >= 'a' && ch <= 'z') ||
@@ -161,6 +174,14 @@ void clearNotesTags() {
     gNotesTagCount = 0;
     for (size_t i = 0; i < kNotesMaxTags; ++i) {
         gNotesTags[i] = "";
+    }
+    gNotesActiveTagIndex = kNotesTagFilterAll;
+}
+
+void clearNotesLinks() {
+    gNotesLinkCount = 0;
+    for (size_t i = 0; i < kNotesMaxLinks; ++i) {
+        gNotesLinks[i] = "";
     }
 }
 
@@ -176,6 +197,20 @@ void addNotesTagUnique(const String &tag) {
     }
 
     gNotesTags[gNotesTagCount++] = tag;
+}
+
+void addNotesLinkUnique(const String &link) {
+    if (link.isEmpty() || gNotesLinkCount >= kNotesMaxLinks) {
+        return;
+    }
+
+    for (size_t i = 0; i < gNotesLinkCount; ++i) {
+        if (gNotesLinks[i].equalsIgnoreCase(link)) {
+            return;
+        }
+    }
+
+    gNotesLinks[gNotesLinkCount++] = link;
 }
 
 void refreshNotesTagsFromBuffer() {
@@ -197,6 +232,43 @@ void refreshNotesTagsFromBuffer() {
         addNotesTagUnique(tag);
         i = j;
     }
+
+    if (gNotesTagCount == 0) {
+        gNotesActiveTagIndex = kNotesTagFilterAll;
+    } else if (gNotesActiveTagIndex >= static_cast<int>(gNotesTagCount)) {
+        gNotesActiveTagIndex = kNotesTagFilterAll;
+    }
+}
+
+void refreshNotesLinksFromBuffer() {
+    clearNotesLinks();
+
+    const size_t len = gNotesBuffer.length();
+    for (size_t i = 0; i + 1 < len; ++i) {
+        if (gNotesBuffer[i] != '[' || gNotesBuffer[i + 1] != '[') {
+            continue;
+        }
+
+        const size_t start = i + 2;
+        size_t end = start;
+        while (end + 1 < len && !(gNotesBuffer[end] == ']' && gNotesBuffer[end + 1] == ']')) {
+            ++end;
+        }
+
+        if (end + 1 >= len) {
+            break;
+        }
+
+        String link = gNotesBuffer.substring(start, end);
+        link.trim();
+        addNotesLinkUnique(link);
+        i = end + 1;
+    }
+}
+
+void refreshNotesMetadataFromBuffer() {
+    refreshNotesTagsFromBuffer();
+    refreshNotesLinksFromBuffer();
 }
 
 String notesCurrentDraftTag() {
@@ -235,6 +307,260 @@ String notesTagsSummary(size_t maxChars) {
     return prefixed.substring(0, maxChars - 3) + String("...");
 }
 
+String notesLinksSummary(size_t maxChars) {
+    String text;
+    for (size_t i = 0; i < gNotesLinkCount; ++i) {
+        if (!text.isEmpty()) {
+            text += " | ";
+        }
+        text += gNotesLinks[i];
+    }
+
+    if (text.isEmpty()) {
+        return String("links: (none)");
+    }
+
+    String prefixed = String("links: ") + text;
+    if (prefixed.length() <= maxChars) {
+        return prefixed;
+    }
+
+    return prefixed.substring(0, maxChars - 3) + String("...");
+}
+
+String notesActiveTag() {
+    if (gNotesActiveTagIndex < 0 || gNotesActiveTagIndex >= static_cast<int>(gNotesTagCount)) {
+        return String();
+    }
+    return gNotesTags[gNotesActiveTagIndex];
+}
+
+String notesFilterLabel() {
+    const String active = notesActiveTag();
+    if (active.isEmpty()) {
+        return String("filter: all");
+    }
+    return String("filter: ") + active;
+}
+
+bool notesLineContainsTag(const String &line, const String &tag) {
+    if (tag.isEmpty()) {
+        return true;
+    }
+
+    String loweredLine = line;
+    loweredLine.toLowerCase();
+    String loweredTag = tag;
+    loweredTag.toLowerCase();
+    return loweredLine.indexOf(loweredTag) >= 0;
+}
+
+String notesPreviewForActiveFilter(size_t maxChars) {
+    const String active = notesActiveTag();
+    if (active.isEmpty()) {
+        return notesTailPreview(maxChars);
+    }
+
+    String filtered;
+    int start = 0;
+    while (start <= static_cast<int>(gNotesBuffer.length())) {
+        int end = gNotesBuffer.indexOf('\n', start);
+        if (end < 0) {
+            end = gNotesBuffer.length();
+        }
+
+        String line = gNotesBuffer.substring(start, end);
+        line.trim();
+        if (!line.isEmpty() && notesLineContainsTag(line, active)) {
+            if (!filtered.isEmpty()) {
+                filtered += " | ";
+            }
+            filtered += line;
+            if (filtered.length() > maxChars + 12) {
+                break;
+            }
+        }
+
+        if (end >= static_cast<int>(gNotesBuffer.length())) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    if (filtered.isEmpty()) {
+        return String("(no lines for ") + active + String(")");
+    }
+
+    if (filtered.length() <= maxChars) {
+        return filtered;
+    }
+    return filtered.substring(0, maxChars - 3) + String("...");
+}
+
+String notesStyleLineForBrowse(String line) {
+    line.trim();
+    if (line.startsWith("###### ")) {
+        line = String("H6 ") + line.substring(7);
+    } else if (line.startsWith("##### ")) {
+        line = String("H5 ") + line.substring(6);
+    } else if (line.startsWith("#### ")) {
+        line = String("H4 ") + line.substring(5);
+    } else if (line.startsWith("### ")) {
+        line = String("H3 ") + line.substring(4);
+    } else if (line.startsWith("## ")) {
+        line = String("H2 ") + line.substring(3);
+    } else if (line.startsWith("# ")) {
+        line = String("H1 ") + line.substring(2);
+    } else if (line.startsWith("> [!")) {
+        line = String("CALLOUT ") + line.substring(4);
+    } else if (line.startsWith("> ")) {
+        line = String("QUOTE ") + line.substring(2);
+    } else if (line.startsWith("- [ ] ") || line.startsWith("* [ ] ") || line.startsWith("+ [ ] ")) {
+        line = String("[ ] ") + line.substring(6);
+    } else if (line.startsWith("- [x] ") || line.startsWith("* [x] ") || line.startsWith("+ [x] ") ||
+               line.startsWith("- [X] ") || line.startsWith("* [X] ") || line.startsWith("+ [X] ")) {
+        line = String("[x] ") + line.substring(6);
+    } else if (isOrderedListPrefix(line)) {
+        // Keep explicit ordered-list marker while compacting display.
+    } else if (line.startsWith("- ") || line.startsWith("* ") || line.startsWith("+ ")) {
+        line = String("* ") + line.substring(2);
+    }
+
+    if (line == "---" || line == "***" || line == "___") {
+        line = "HR";
+    }
+
+    // Lightweight markdown emphasis fallback for low-resolution displays.
+    line.replace("**", "");
+    line.replace("__", "");
+    line.replace("~~", "");
+    line.replace("==", "");
+
+    int embedStart = line.indexOf("![[");
+    while (embedStart >= 0) {
+        const int embedEnd = line.indexOf("]]", embedStart + 3);
+        if (embedEnd < 0) {
+            break;
+        }
+
+        String inside = line.substring(embedStart + 3, embedEnd);
+        inside.trim();
+        line = line.substring(0, embedStart) + String("embed:") + inside + line.substring(embedEnd + 2);
+        embedStart = line.indexOf("![[", embedStart + 6);
+    }
+
+    int linkStart = line.indexOf("[[");
+    while (linkStart >= 0) {
+        const int linkEnd = line.indexOf("]]", linkStart + 2);
+        if (linkEnd < 0) {
+            break;
+        }
+
+        String inside = line.substring(linkStart + 2, linkEnd);
+        inside.trim();
+        String target = inside;
+        String label = inside;
+        const int pipe = inside.indexOf('|');
+        if (pipe >= 0) {
+            target = inside.substring(0, pipe);
+            label = inside.substring(pipe + 1);
+            target.trim();
+            label.trim();
+            if (label.isEmpty()) {
+                label = target;
+            }
+        }
+        line = line.substring(0, linkStart) + label + String("->") + target + line.substring(linkEnd + 2);
+        linkStart = line.indexOf("[[", linkStart + 2);
+    }
+
+    int mdTextStart = line.indexOf('[');
+    while (mdTextStart >= 0) {
+        const int mdTextEnd = line.indexOf(']', mdTextStart + 1);
+        if (mdTextEnd < 0 || mdTextEnd + 1 >= static_cast<int>(line.length()) || line[mdTextEnd + 1] != '(') {
+            break;
+        }
+
+        const int mdUrlEnd = line.indexOf(')', mdTextEnd + 2);
+        if (mdUrlEnd < 0) {
+            break;
+        }
+
+        const String text = line.substring(mdTextStart + 1, mdTextEnd);
+        const String url = line.substring(mdTextEnd + 2, mdUrlEnd);
+        line = line.substring(0, mdTextStart) + text + String("->") + url + line.substring(mdUrlEnd + 1);
+        mdTextStart = line.indexOf('[', mdTextStart + 2);
+    }
+
+    return line;
+}
+
+bool isOrderedListPrefix(const String &line) {
+    if (line.length() < 3) {
+        return false;
+    }
+
+    size_t i = 0;
+    while (i < line.length() && line[i] >= '0' && line[i] <= '9') {
+        ++i;
+    }
+
+    if (i == 0 || i + 1 >= line.length()) {
+        return false;
+    }
+
+    const char marker = line[i];
+    return (marker == '.' || marker == ')') && line[i + 1] == ' ';
+}
+
+String notesStyledPreviewForActiveFilter(size_t maxChars) {
+    const String active = notesActiveTag();
+    String filtered;
+    bool inCodeBlock = false;
+    int start = 0;
+    while (start <= static_cast<int>(gNotesBuffer.length())) {
+        int end = gNotesBuffer.indexOf('\n', start);
+        if (end < 0) {
+            end = gNotesBuffer.length();
+        }
+
+        String line = gNotesBuffer.substring(start, end);
+        line.trim();
+        if (!line.isEmpty() && (active.isEmpty() || notesLineContainsTag(line, active))) {
+            if (!filtered.isEmpty()) {
+                filtered += " | ";
+            }
+
+            if (line.startsWith("```") || line.startsWith("~~~")) {
+                inCodeBlock = !inCodeBlock;
+                filtered += inCodeBlock ? String("CODE BLOCK START") : String("CODE BLOCK END");
+            } else if (inCodeBlock) {
+                filtered += String("` ") + line;
+            } else {
+                filtered += notesStyleLineForBrowse(line);
+            }
+
+            if (filtered.length() > maxChars + 12) {
+                break;
+            }
+        }
+
+        if (end >= static_cast<int>(gNotesBuffer.length())) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    if (filtered.isEmpty()) {
+        return active.isEmpty() ? String("(empty)") : String("(no lines for ") + active + String(")");
+    }
+
+    if (filtered.length() <= maxChars) {
+        return filtered;
+    }
+    return filtered.substring(0, maxChars - 3) + String("...");
+}
+
 size_t notesTotalChars() {
     return gNotesBuffer.length() + gNotesDraftWord.length();
 }
@@ -256,7 +582,7 @@ bool commitNotesDraftWord(SystemState &state, bool withTrailingSpace) {
     }
     gNotesDraftWord = "";
     state.notes.dirty = true;
-    refreshNotesTagsFromBuffer();
+    refreshNotesMetadataFromBuffer();
     return true;
 }
 
@@ -269,22 +595,25 @@ bool ensureNotesLoaded(SystemState &state, Stream &out) {
     gNotesBuffer = "";
     gNotesDraftWord = "";
     clearNotesTags();
+    clearNotesLinks();
 
     if (!state.littleFsReady) {
         state.notes.statusMessage = "LittleFS off";
         return false;
     }
 
-    String path = state.notes.filePath;
-    if (path.isEmpty()) {
-        path = "/notes/quicknote.txt";
-        state.notes.filePath = path;
-    }
+    String path = normalizedNotesPath(state);
+    const String legacyPath = "/notes/quicknote.txt";
 
     if (!LittleFS.exists(path)) {
-        state.notes.statusMessage = "new note";
-        state.notes.dirty = false;
-        return true;
+        if (path == "/notes/quicknote.md" && LittleFS.exists(legacyPath)) {
+            path = legacyPath;
+            state.notes.statusMessage = "legacy txt loaded";
+        } else {
+            state.notes.statusMessage = "new note";
+            state.notes.dirty = false;
+            return true;
+        }
     }
 
     File file = LittleFS.open(path, "r");
@@ -294,14 +623,19 @@ bool ensureNotesLoaded(SystemState &state, Stream &out) {
     }
 
     gNotesBuffer.reserve(kNotesMaxChars + 1);
-    while (file.available() && gNotesBuffer.length() < kNotesMaxChars) {
+    while (file.available() && gNotesBuffer.length() < (kNotesMaxChars * 2)) {
         gNotesBuffer += static_cast<char>(file.read());
     }
     file.close();
 
+    gNotesBuffer = normalizeMarkdownText(gNotesBuffer);
+    if (gNotesBuffer.length() > kNotesMaxChars) {
+        gNotesBuffer = gNotesBuffer.substring(0, kNotesMaxChars);
+    }
+
     state.notes.statusMessage = "loaded";
     state.notes.dirty = false;
-    refreshNotesTagsFromBuffer();
+    refreshNotesMetadataFromBuffer();
     return true;
 }
 
@@ -311,11 +645,7 @@ bool saveNotes(SystemState &state, Stream &out) {
         return false;
     }
 
-    String path = state.notes.filePath;
-    if (path.isEmpty()) {
-        path = "/notes/quicknote.txt";
-        state.notes.filePath = path;
-    }
+    String path = normalizedNotesPath(state);
 
     const int slash = path.lastIndexOf('/');
     if (slash > 0) {
@@ -331,13 +661,51 @@ bool saveNotes(SystemState &state, Stream &out) {
         return false;
     }
 
-    file.print(gNotesBuffer);
+    file.print(normalizeMarkdownText(gNotesBuffer));
     file.close();
     state.notes.dirty = false;
     state.notes.statusMessage = "saved";
     out.print("Notes: saved ");
     out.println(path);
     return true;
+}
+
+String normalizedNotesPath(SystemState &state) {
+    String path = state.notes.filePath;
+    path.trim();
+    if (path.isEmpty() || path.equalsIgnoreCase("/notes/quicknote.txt")) {
+        path = "/notes/quicknote.md";
+    }
+
+    if (!path.startsWith("/")) {
+        path = String("/") + path;
+    }
+
+    state.notes.filePath = path;
+    return path;
+}
+
+String normalizeMarkdownText(const String &raw) {
+    String text = raw;
+    if (text.length() >= 3 && static_cast<uint8_t>(text[0]) == 0xEF && static_cast<uint8_t>(text[1]) == 0xBB && static_cast<uint8_t>(text[2]) == 0xBF) {
+        text = text.substring(3);
+    }
+
+    String normalized;
+    normalized.reserve(text.length());
+    for (size_t i = 0; i < text.length(); ++i) {
+        const char c = text[i];
+        if (c == '\r') {
+            if (i + 1 < text.length() && text[i + 1] == '\n') {
+                continue;
+            }
+            normalized += '\n';
+            continue;
+        }
+        normalized += c;
+    }
+
+    return normalized;
 }
 
 String notesTailPreview(size_t maxChars) {
@@ -2599,19 +2967,81 @@ void resetNotesSession(SystemState &state) {
     state.notes.loaded = false;
     state.notes.dirty = false;
     state.notes.statusMessage = "ready";
+    state.notes.viewMode = kNotesViewWrite;
     gNotesDraftWord = "";
     clearNotesTags();
+    clearNotesLinks();
 }
 
 bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode, bool &refreshEink, Stream &out) {
     refreshEink = false;
     ensureNotesLoaded(state, out);
+    const bool writeMode = state.notes.viewMode == kNotesViewWrite;
+
+    if (normalizedKey == '\t' || static_cast<uint8_t>(normalizedKey) == 0x1B) {
+        if (state.notes.viewMode == kNotesViewRead) {
+            state.notes.viewMode = kNotesViewWrite;
+            state.notes.statusMessage = "mode: write";
+        } else {
+            state.notes.viewMode = kNotesViewRead;
+            state.notes.statusMessage = "mode: read";
+        }
+        refreshEink = true;
+        return true;
+    }
+
+    // Keep arrow keys out of text input path.
+    if (isCardKbLeftArrowCode(rawCode)) {
+        // Let global back handler process this key.
+        return false;
+    }
 
     if (isCardKbRightArrowCode(rawCode)) {
         commitNotesDraftWord(state, false);
         saveNotes(state, out);
+        refreshNotesMetadataFromBuffer();
         refreshEink = true;
         return true;
+    }
+
+    if (isCardKbUpArrowCode(rawCode) || isCardKbDownArrowCode(rawCode)) {
+        if (gNotesTagCount == 0) {
+            gNotesActiveTagIndex = kNotesTagFilterAll;
+            state.notes.statusMessage = "no tags";
+            return true;
+        }
+
+        const bool isUp = isCardKbUpArrowCode(rawCode);
+        if (isUp) {
+            if (gNotesActiveTagIndex == kNotesTagFilterAll) {
+                gNotesActiveTagIndex = static_cast<int>(gNotesTagCount) - 1;
+            } else {
+                --gNotesActiveTagIndex;
+                if (gNotesActiveTagIndex < 0) {
+                    gNotesActiveTagIndex = kNotesTagFilterAll;
+                }
+            }
+        } else {
+            if (gNotesActiveTagIndex == kNotesTagFilterAll) {
+                gNotesActiveTagIndex = 0;
+            } else {
+                ++gNotesActiveTagIndex;
+                if (gNotesActiveTagIndex >= static_cast<int>(gNotesTagCount)) {
+                    gNotesActiveTagIndex = kNotesTagFilterAll;
+                }
+            }
+        }
+
+        state.notes.statusMessage = notesFilterLabel();
+        refreshEink = true;
+        return true;
+    }
+
+    if (!writeMode) {
+        if (normalizedKey == 8 || normalizedKey == ' ' || normalizedKey == '\r' || normalizedKey == '\n' || (normalizedKey >= 32 && normalizedKey <= 126)) {
+            state.notes.statusMessage = "read only";
+            return true;
+        }
     }
 
     if (normalizedKey == 8) {
@@ -2622,7 +3052,7 @@ bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode
             gNotesBuffer.remove(gNotesBuffer.length() - 1);
             state.notes.dirty = true;
             state.notes.statusMessage = "edited";
-            refreshNotesTagsFromBuffer();
+            refreshNotesMetadataFromBuffer();
             refreshEink = true;
         }
         return true;
@@ -2687,19 +3117,23 @@ bool renderMusicPlayerScreen(SystemState &state, bool oledOnly, Stream &out) {
 
 bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out) {
     ensureNotesLoaded(state, out);
+    const bool writeMode = state.notes.viewMode == kNotesViewWrite;
+    const String modeLine = writeMode ? String("mode: write") : String("mode: read");
 
     if (state.oledReady && state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         String charsLine = String("chars: ") + String(static_cast<unsigned>(notesTotalChars())) + (state.notes.dirty ? " *" : "");
-        String draftLine = String("word: ") + (gNotesDraftWord.isEmpty() ? String("(none)") : gNotesDraftWord);
-        String tagsLine = notesTagsSummary(26);
+        String tagsLine = notesTagsSummary(24);
+        String linksLine = notesLinksSummary(24);
+        String filterLine = notesFilterLabel();
 
         gOled.clearBuffer();
         gOled.setFont(u8g2_font_6x10_tf);
-        gOled.drawStr(0, 12, "NOTES");
-        gOled.drawStr(0, 24, charsLine.c_str());
-        gOled.drawStr(0, 36, state.notes.statusMessage.c_str());
-        gOled.drawStr(0, 48, draftLine.c_str());
-        gOled.drawStr(0, 60, tagsLine.c_str());
+        gOled.drawStr(0, 10, "NOTES");
+        gOled.drawStr(0, 20, modeLine.c_str());
+        gOled.drawStr(0, 30, charsLine.c_str());
+        gOled.drawStr(0, 40, state.notes.statusMessage.c_str());
+        gOled.drawStr(0, 50, filterLine.c_str());
+        gOled.drawStr(0, 60, writeMode ? tagsLine.c_str() : linksLine.c_str());
         gOled.sendBuffer();
         xSemaphoreGive(state.spiMutex);
     }
@@ -2708,19 +3142,45 @@ bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out) {
         return state.oledReady;
     }
 
-    String line1 = String("chars: ") + String(static_cast<unsigned>(gNotesBuffer.length())) + (state.notes.dirty ? " *" : "");
-    String line2 = state.notes.statusMessage + String(" | tags:") + String(static_cast<unsigned>(gNotesTagCount));
-    String line3 = notesTailPreview(28);
-    line3.replace("\n", " ");
+    if (!ensureEinkInitialized(state, out)) {
+        return state.oledReady;
+    }
 
-    return renderStatusScreen(
-        state,
-        "NOTES",
-        line1,
-        line2,
-        line3,
-        oledOnly,
-        out);
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        Paint paint(gEinkBuffer, kEinkNativeWidth, kEinkNativeHeight);
+        prepareLandscapePaint(paint);
+        paint.Clear(kUncolored);
+        paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
+        paint.DrawStringAt(8, 10, "NOTES", &Font16, kColored);
+
+        String metaLine = modeLine + String(" chars:") + String(static_cast<unsigned>(gNotesBuffer.length())) +
+                          (state.notes.dirty ? " *" : "") +
+                          String(" status:") + state.notes.statusMessage;
+        paint.DrawStringAt(8, 28, metaLine.c_str(), &Font12, kColored);
+        paint.DrawLine(0, 40, kEinkLandscapeWidth - 1, 40, kColored);
+
+        // Tags are rendered in their own boxed area so they stand out from note text.
+        paint.DrawRectangle(8, 48, kEinkLandscapeWidth - 8, 78, kColored);
+        paint.DrawStringAt(12, 62, "TAGS", &Font12, kColored);
+        String tagsLine = notesTagsSummary(40);
+        paint.DrawStringAtUtf8(56, 62, tagsLine.c_str(), &Font12, kColored);
+        paint.DrawStringAtUtf8(8, 82, notesFilterLabel().c_str(), &Font12, kColored);
+
+        String linksLine = notesLinksSummary(46);
+        String previewLine = writeMode ? notesPreviewForActiveFilter(46) : notesStyledPreviewForActiveFilter(46);
+        previewLine.replace("\n", " ");
+        paint.DrawStringAtUtf8(8, 98, linksLine.c_str(), &Font12, kColored);
+        paint.DrawStringAt(8, 112, writeMode ? "WRITE" : "READ", &Font12, kColored);
+        paint.DrawStringAtUtf8(66, 112, previewLine.c_str(), &Font12, kColored);
+        paint.DrawStringAt(8, 126, "up/down=tag  tab/esc=read/write", &Font12, kColored);
+
+        gEink.display(paint.GetImage());
+        refreshEinkWithCadence(false);
+        xSemaphoreGive(state.spiMutex);
+    }
+
+    noteDisplayActivity();
+    return true;
 }
 
 bool ensureEinkInitialized(SystemState &state, Stream &out) {

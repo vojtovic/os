@@ -258,6 +258,49 @@ Use this file as the shared context between agents in this workspace.
 4. Verify: run `platformio run` after patch set.
 5. Review: confirm Bluetooth scan/select/disconnect still works and saved device data can be erased from settings.
 
+## Execution Plan (Notes Two Modes: Read + Browse)
+1. Strategy: preserve existing Notes edit/save flow and add two explicit display modes without hijacking normal text typing.
+2. Ideas: keep current tag filtering, add wiki-link metadata extraction, and render a style-aware preview in browse mode while read mode keeps raw text behavior.
+3. Build: extend Notes state with mode flag, add mode toggle on control keys (`Tab`/`Esc`), and update OLED/e-ink Notes render sections.
+4. Verify: run `platformio run` after edits.
+5. Review: check regressions in save (`->`), back (`<-`), tag cycling (`up/down`), and shell/launcher launch behavior.
+
+## Stage Status (Notes Two Modes: Read + Browse)
+- Strategy: done, evidence: user requested two Notes modes (read + styled browse) with Obsidian-like tags/links behavior, next stage: ideas.
+- Ideas: done, evidence: selected low-risk UI-only mode split with metadata extraction and control-key toggling to keep text entry intact, next stage: build.
+- Build: done, evidence: patched `SystemState` + `DisplayManager` with notes mode state, wiki-link extraction, mode toggling (`Tab`/`Esc`), and browse-style preview rendering, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after Notes two-mode patch set, next stage: review.
+- Review: done, evidence: right-arrow save, left-arrow global back, and up/down tag cycling paths remain active with mode switch isolated to control keys, next stage: optimize.
+- Optimize: done, evidence: implementation stays in existing Notes helper/render path with no new module coupling or boot-time init changes, next stage: explain.
+- Explain: done, evidence: Notes now supports explicit read vs style-aware browse viewing while preserving current editing workflow, next stage: on-device UX validation.
+
+## Stage Status (Notes Read/Write Semantics)
+- Strategy: done, evidence: user clarified that Browse naming/behavior is confusing and asked for Read + Write modes instead, next stage: build.
+- Build: done, evidence: switched Notes mode semantics to `read`/`write`, defaulted app launch to write mode, and blocked text edits in read-only mode while keeping save/back/tag controls, next stage: verify.
+
+## Stage Status (Notes Markdown Headings H1-H6)
+- Strategy: done, evidence: user requested support for markdown heading syntax `#` through `######` in Notes, next stage: build.
+- Build: done, evidence: extended notes styled-line parser to map `#..######` to heading levels `H1..H6` with longest-prefix matching, next stage: verify.
+
+## Execution Plan (Notes Obsidian Interoperability)
+1. Strategy: align Notes file format and parser behavior with Obsidian Flavored Markdown so files can be moved ESP <-> PC without manual conversion.
+2. Ideas: switch default note path to `.md`, keep legacy `.txt` fallback for backward compatibility, and extend read-mode parser for core OFM structures.
+3. Build: patch `SystemState` + `DisplayManager` load/save + parser helpers (line endings/BOM normalization, links, embeds, tasks, headings, callouts, ordered lists, code fences).
+4. Verify: run `platformio run`.
+5. Review: ensure read/write controls and tag filtering remain stable while improving markdown readability.
+
+## Stage Status (Notes Obsidian Interoperability)
+- Strategy: done, evidence: user requested cross-compatibility so ESP notes can open in Obsidian and Obsidian notes can open on ESP, next stage: ideas.
+- Ideas: done, evidence: selected OFM-focused parser upgrade with `.md` default path and safe legacy fallback to `/notes/quicknote.txt`, next stage: build.
+- Build: done, evidence: added `.md` default, markdown text normalization, ordered/checklist/callout/embed/link parsing, and fenced-code handling in Notes read-mode preview, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after interoperability patch set, next stage: review.
+- Review: done, evidence: Notes read-only/write mode switching and save/back/tag controls remained intact while parser coverage expanded, next stage: explain.
+
+## Stage Status (README Sync)
+- Strategy: done, evidence: user requested that all recently added/changed behavior be documented in README, next stage: build.
+- Build: done, evidence: updated `README.md` with current shell commands, implemented app capabilities, Notes read/write + Obsidian compatibility, and known Bluetooth/A2DP limitations, next stage: review.
+- Review: done, evidence: README now reflects actual runtime behavior and near-term roadmap without changing firmware code paths, next stage: explain.
+
 ## Stage Status (Bluetooth Completion)
 - Strategy: done, evidence: user requested finishing Bluetooth after WiFi completion, next stage: ideas.
 - Ideas: done, evidence: selected low-risk persistence + forget flow (no new background pairing logic), next stage: build.
@@ -407,6 +450,18 @@ Use this file as the shared context between agents in this workspace.
 - Build: done, evidence: added notes tag parser/summary and integrated tag status into notes input/render paths, next stage: verify.
 - Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after notes tags patch, next stage: review.
 - Review: done, evidence: notes still redraw e-ink only on commit/save events while tags are refreshed on committed-buffer changes, next stage: explain.
+
+## Stage Status (Notes Arrow Input Guard)
+- Strategy: done, evidence: user reported arrow keys in notes input are again appearing as numeric characters, next stage: build.
+- Build: done, evidence: added raw arrow guards in `handleNotesAppInput` so left is passed to global back handler, right remains save, and up/down are ignored for text entry, next stage: verify.
+
+## Stage Status (Notes Tags Visual Integration)
+- Strategy: done, evidence: user requested tags to render differently from note text, next stage: build.
+- Build: done, evidence: replaced notes e-ink generic status rendering with a dedicated layout containing separate TAGS and TEXT sections, next stage: verify.
+
+## Stage Status (Notes Tags Semantic Behavior)
+- Strategy: done, evidence: user requested tags to have functional meaning, not only visual distinction, next stage: build.
+- Build: done, evidence: added active tag filter state and up/down tag cycling so Notes preview can show only lines matching selected `#tag`, next stage: verify.
 
 ## Stage Status (Notes E-ink Text Visibility Fix)
 - Strategy: done, evidence: user reported e-ink no longer shows note words after tags update, next stage: build.

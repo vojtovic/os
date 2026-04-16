@@ -19,7 +19,7 @@ The project already boots, builds, and exposes a working serial shell. Hardware 
 Working features:
 
 - serial startup log and prompt
-- loop heartbeat for runtime verification
+- reduced high-frequency runtime logs for smoother serial monitor behavior
 - LittleFS mount and config loading
 - SD card initialization
 - I2C hardware initialization
@@ -30,6 +30,11 @@ Working features:
 - Waveshare 3.52" e-ink support
 - diagnostic shell commands
 - dual-core task registration
+- launcher with desktop + notifications + paged app grid
+- settings app with WiFi manager, Bluetooth manager, and SD manager
+- file manager app with SD browse/copy/move/delete/create-folder actions
+- web upload app and shell-managed background server lifecycle
+- notes app with read/write modes and markdown-aware read preview
 
 ## Hardware
 
@@ -77,7 +82,16 @@ Available commands include:
 - config set name <value>
 - config set sd on|off
 - config set sd_speed <hz>
+- web-upload status|start|stop
+- a2dp status|start <bt-name>|stop
 - display info
+- launcher show
+- launcher next
+- launcher prev
+- launcher refresh
+- launcher open <settings|file-manager|music-player|notes|web-upload|apps|serial|about>
+- launcher list
+- settings show
 - oled test
 - eink test [text]
 - hw info
@@ -87,6 +101,46 @@ Available commands include:
 - kb read
 - reboot
 - prompt
+
+## Notes App (Obsidian-Compatible)
+
+The Notes app is designed for practical file movement between ESP and desktop Obsidian vaults.
+
+Storage path behavior:
+
+- default file: /notes/quicknote.md
+- legacy fallback: /notes/quicknote.txt is still readable for backward compatibility
+- load/save normalization: UTF-8 BOM is removed and CRLF is normalized to LF
+
+Modes and controls:
+
+- write mode: text editing enabled
+- read mode: read-only to avoid accidental edits
+- Tab or Esc: switch read/write mode
+- right arrow: save note
+- left arrow: global back navigation
+- up/down arrows: cycle active tag filter
+
+Supported markdown and Obsidian-style constructs in read preview:
+
+- headings H1-H6 (`#` to `######`)
+- unordered lists (`-`, `*`, `+`)
+- ordered lists (`1.` and `1)`)
+- task lists (`- [ ]`, `- [x]`)
+- quotes (`> ...`)
+- callouts (`> [!note]` style lines)
+- horizontal rules (`---`, `***`, `___`)
+- fenced code blocks (``` and ~~~)
+- wikilinks (`[[Note]]`)
+- wikilink alias form (`[[Note|Label]]`)
+- embeds (`![[File]]`)
+- markdown links (`[text](url)`)
+- in-note hashtag tags for filtering (`#tag`)
+
+Practical interoperability goal:
+
+- files written on ESP open in Obsidian without conversion
+- notes authored in Obsidian remain readable on ESP with markdown-aware preview
 
 ## Music Player on SD
 
@@ -112,6 +166,10 @@ Launcher behavior:
 
 Note: ESP32-S3 does not execute native firmware code from SD card in this project.
 The app logic stays in firmware, while tracks and playlist/config data are loaded from SD.
+
+Current implementation note:
+
+- the music-player UI is currently a skeleton placeholder while dual-chip audio transport is prepared
 
 ## Build
 
@@ -142,6 +200,12 @@ The monitor speed is 115200.
 - The main loop prints a heartbeat so it is easy to verify that the firmware is alive.
 - The board is currently configured to use the default serial behavior for the ESP32-S3 board definition.
 
+## Bluetooth Audio Limitation
+
+- ESP32-S3 is BLE-only and does not support Bluetooth Classic BR/EDR.
+- Classic A2DP source playback (for many headsets like AirPods) is not supported directly on this MCU.
+- The current architecture direction is dual-chip: ESP32-S3 for UI/system + classic ESP32 for A2DP/audio transport.
+
 ## Status
 
 This repository is still a work in progress, but the base hardware, storage, display, shell, and task scaffolding are already in place.
@@ -152,5 +216,6 @@ Planned follow-up work for the next session:
 
 - make WiFi and Bluetooth scans non-blocking so menus stay responsive
 - move more long-running work out of the foreground UI path
-- continue the web upload app with safer background servicing and better status output
-- keep SD playback as the next larger subsystem after the UI stays responsive
+- continue web upload and settings modularization with tighter service boundaries
+- expand Notes parser coverage for additional Obsidian Flavored Markdown features as needed
+- connect music-player UI skeleton to the planned dual-chip audio transport path

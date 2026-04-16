@@ -30,10 +30,11 @@ struct MusicPlayerState {
 };
 
 struct NotesState {
-    String filePath = "/notes/quicknote.txt";
+    String filePath = "/notes/quicknote.md";
     String statusMessage = "ready";
     bool loaded = false;
     bool dirty = false;
+    uint8_t viewMode = 0;
 };
 
 struct SettingsState {
