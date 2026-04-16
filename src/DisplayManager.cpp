@@ -1,6 +1,7 @@
 #include "DisplayManager.h"
 
 #include <U8g2lib.h>
+#include <LittleFS.h>
 #include <SD.h>
 #include <freertos/task.h>
 
@@ -14,6 +15,8 @@
 #include "StorageManager.h"
 
 namespace {
+constexpr bool kEnableEinkCadenceLogging = false;
+
 // Static launcher metadata rendered on both displays.
 struct LauncherApp {
     const char *id;
@@ -30,7 +33,8 @@ constexpr uint8_t kOledCs = 10;
 constexpr LauncherApp kLauncherApps[] = {
     {"settings", "Settings", "Built-in config app"},
     {"file-manager", "File Manager", "SD file browser"},
-    {"music-player", "Music Player", "SD-backed audio library"},
+    {"music-player", "Music Player", "Skeleton for 2nd ESP audio"},
+    {"notes", "Notes", "Quick notes in LittleFS"},
     {"web-upload", "Web Upload", "Browser file upload"},
     {"apps", "SD Apps", "Loaded from manifest"},
     {"serial", "Serial", "Debug shell"},
@@ -72,6 +76,12 @@ String gMusicTrackPaths[kMaxMusicTracks];
 size_t gMusicTrackCount = 0;
 bool gMusicCacheDirty = true;
 bool gMusicCachePrimed = false;
+constexpr size_t kNotesMaxChars = 1200;
+String gNotesBuffer;
+String gNotesDraftWord;
+constexpr size_t kNotesMaxTags = 16;
+String gNotesTags[kNotesMaxTags];
+size_t gNotesTagCount = 0;
 uint32_t gLastDisplayActivityMs = 0;
 bool gEinkSleeping = false;
 bool gOledSleeping = false;
@@ -136,6 +146,211 @@ String musicPlayerTrackLabelAt(size_t index);
 void drawMusicPlayerOled(const SystemState &state);
 bool handleMusicPlayerAppInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out);
 bool renderMusicPlayerScreen(SystemState &state, bool oledOnly, Stream &out);
+void resetNotesSession(SystemState &state);
+bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode, bool &refreshEink, Stream &out);
+bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out);
+
+bool isNotesTagChar(char ch) {
+    return (ch >= 'a' && ch <= 'z') ||
+           (ch >= 'A' && ch <= 'Z') ||
+           (ch >= '0' && ch <= '9') ||
+           ch == '_' || ch == '-';
+}
+
+void clearNotesTags() {
+    gNotesTagCount = 0;
+    for (size_t i = 0; i < kNotesMaxTags; ++i) {
+        gNotesTags[i] = "";
+    }
+}
+
+void addNotesTagUnique(const String &tag) {
+    if (tag.length() <= 1 || gNotesTagCount >= kNotesMaxTags) {
+        return;
+    }
+
+    for (size_t i = 0; i < gNotesTagCount; ++i) {
+        if (gNotesTags[i].equalsIgnoreCase(tag)) {
+            return;
+        }
+    }
+
+    gNotesTags[gNotesTagCount++] = tag;
+}
+
+void refreshNotesTagsFromBuffer() {
+    clearNotesTags();
+
+    const size_t len = gNotesBuffer.length();
+    for (size_t i = 0; i < len; ++i) {
+        if (gNotesBuffer[i] != '#') {
+            continue;
+        }
+
+        String tag = "#";
+        size_t j = i + 1;
+        while (j < len && isNotesTagChar(gNotesBuffer[j])) {
+            tag += gNotesBuffer[j];
+            ++j;
+        }
+
+        addNotesTagUnique(tag);
+        i = j;
+    }
+}
+
+String notesCurrentDraftTag() {
+    if (gNotesDraftWord.length() > 1 && gNotesDraftWord[0] == '#') {
+        return gNotesDraftWord;
+    }
+    return String();
+}
+
+String notesTagsSummary(size_t maxChars) {
+    String text;
+    for (size_t i = 0; i < gNotesTagCount; ++i) {
+        if (!text.isEmpty()) {
+            text += ' ';
+        }
+        text += gNotesTags[i];
+    }
+
+    const String draftTag = notesCurrentDraftTag();
+    if (!draftTag.isEmpty()) {
+        if (!text.isEmpty()) {
+            text += ' ';
+        }
+        text += draftTag;
+    }
+
+    if (text.isEmpty()) {
+        return String("tags: (none)");
+    }
+
+    String prefixed = String("tags: ") + text;
+    if (prefixed.length() <= maxChars) {
+        return prefixed;
+    }
+
+    return prefixed.substring(0, maxChars - 3) + String("...");
+}
+
+size_t notesTotalChars() {
+    return gNotesBuffer.length() + gNotesDraftWord.length();
+}
+
+bool commitNotesDraftWord(SystemState &state, bool withTrailingSpace) {
+    if (gNotesDraftWord.isEmpty()) {
+        return false;
+    }
+
+    const size_t extra = gNotesDraftWord.length() + (withTrailingSpace ? 1 : 0);
+    if (gNotesBuffer.length() + extra > kNotesMaxChars) {
+        state.notes.statusMessage = "note full";
+        return false;
+    }
+
+    gNotesBuffer += gNotesDraftWord;
+    if (withTrailingSpace) {
+        gNotesBuffer += ' ';
+    }
+    gNotesDraftWord = "";
+    state.notes.dirty = true;
+    refreshNotesTagsFromBuffer();
+    return true;
+}
+
+bool ensureNotesLoaded(SystemState &state, Stream &out) {
+    if (state.notes.loaded) {
+        return true;
+    }
+
+    state.notes.loaded = true;
+    gNotesBuffer = "";
+    gNotesDraftWord = "";
+    clearNotesTags();
+
+    if (!state.littleFsReady) {
+        state.notes.statusMessage = "LittleFS off";
+        return false;
+    }
+
+    String path = state.notes.filePath;
+    if (path.isEmpty()) {
+        path = "/notes/quicknote.txt";
+        state.notes.filePath = path;
+    }
+
+    if (!LittleFS.exists(path)) {
+        state.notes.statusMessage = "new note";
+        state.notes.dirty = false;
+        return true;
+    }
+
+    File file = LittleFS.open(path, "r");
+    if (!file) {
+        state.notes.statusMessage = "open failed";
+        return false;
+    }
+
+    gNotesBuffer.reserve(kNotesMaxChars + 1);
+    while (file.available() && gNotesBuffer.length() < kNotesMaxChars) {
+        gNotesBuffer += static_cast<char>(file.read());
+    }
+    file.close();
+
+    state.notes.statusMessage = "loaded";
+    state.notes.dirty = false;
+    refreshNotesTagsFromBuffer();
+    return true;
+}
+
+bool saveNotes(SystemState &state, Stream &out) {
+    if (!state.littleFsReady) {
+        state.notes.statusMessage = "LittleFS off";
+        return false;
+    }
+
+    String path = state.notes.filePath;
+    if (path.isEmpty()) {
+        path = "/notes/quicknote.txt";
+        state.notes.filePath = path;
+    }
+
+    const int slash = path.lastIndexOf('/');
+    if (slash > 0) {
+        const String dir = path.substring(0, slash);
+        if (!LittleFS.exists(dir)) {
+            LittleFS.mkdir(dir);
+        }
+    }
+
+    File file = LittleFS.open(path, "w");
+    if (!file) {
+        state.notes.statusMessage = "save failed";
+        return false;
+    }
+
+    file.print(gNotesBuffer);
+    file.close();
+    state.notes.dirty = false;
+    state.notes.statusMessage = "saved";
+    out.print("Notes: saved ");
+    out.println(path);
+    return true;
+}
+
+String notesTailPreview(size_t maxChars) {
+    if (gNotesBuffer.isEmpty()) {
+        return String("(empty)");
+    }
+
+    if (gNotesBuffer.length() <= maxChars) {
+        return gNotesBuffer;
+    }
+
+    return String("...") + gNotesBuffer.substring(gNotesBuffer.length() - maxChars);
+}
 
 size_t utf8GlyphCount(const char *text) {
     if (!text) {
@@ -1296,6 +1511,9 @@ String launcherIconLabelAt(size_t absoluteIndex) {
     if (id.equalsIgnoreCase("music-player") || id.equalsIgnoreCase("sdapp:music-player")) {
         return String("MP");
     }
+    if (id.equalsIgnoreCase("notes")) {
+        return String("NT");
+    }
     if (id.equalsIgnoreCase("apps")) {
         return String("AP");
     }
@@ -1413,6 +1631,14 @@ void drawLauncherIcon(Paint &paint, int x, int y, int size, const String &itemId
         return;
     }
 
+    if (itemId.equalsIgnoreCase("notes")) {
+        paint.DrawRectangle(x + 4, y + 3, x2 - 4, y2 - 3, kColored);
+        paint.DrawLine(x + 7, y + 8, x2 - 7, y + 8, kColored);
+        paint.DrawLine(x + 7, y + 12, x2 - 7, y + 12, kColored);
+        paint.DrawLine(x + 7, y + 16, x2 - 7, y + 16, kColored);
+        return;
+    }
+
     if (itemId.equalsIgnoreCase("apps")) {
         paint.DrawRectangle(x + 3, y + 3, x + 8, y + 8, kColored);
         paint.DrawRectangle(x + 10, y + 3, x + 15, y + 8, kColored);
@@ -1483,6 +1709,23 @@ void drawActiveAppOled(const SystemState &state) {
 
     if (state.launcher.activeAppId.equalsIgnoreCase("music-player") || state.launcher.activeAppId.equalsIgnoreCase("sdapp:music-player")) {
         drawMusicPlayerOled(state);
+        return;
+    }
+
+    if (state.launcher.activeAppId.equalsIgnoreCase("notes")) {
+        String charsLine = String("chars: ") + String(static_cast<unsigned>(gNotesBuffer.length()));
+        String statusLine = String("status: ") + state.notes.statusMessage;
+        String preview = notesTailPreview(18);
+        preview.replace("\n", " ");
+
+        gOled.clearBuffer();
+        gOled.setFont(u8g2_font_6x10_tf);
+        gOled.drawStr(0, 12, "NOTES");
+        gOled.drawStr(0, 24, charsLine.c_str());
+        gOled.drawStr(0, 36, statusLine.c_str());
+        gOled.drawStr(0, 48, preview.c_str());
+        gOled.drawStr(0, 62, "type, -> save, <- back");
+        gOled.sendBuffer();
         return;
     }
 
@@ -2341,93 +2584,81 @@ void drawMusicPlayerEink(const SystemState &state) {
 }
 
 bool handleMusicPlayerAppInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out) {
-    refreshMusicPlayerLibrary(state, out);
+    (void)rawCode;
+    (void)out;
 
-    const size_t totalCount = gMusicTrackCount;
-    const bool hasTracks = totalCount > 0;
-    if (hasTracks && state.musicPlayer.selectedIndex >= totalCount) {
-        state.musicPlayer.selectedIndex = static_cast<uint8_t>(totalCount - 1);
+    if (normalizedKey == '1' || normalizedKey == '2' || normalizedKey == '3' || normalizedKey == '4' || normalizedKey == 'r' || normalizedKey == 'R' || normalizedKey == ' ' || normalizedKey == '\r') {
+        state.musicPlayer.statusMessage = "skeleton only";
+        return true;
     }
 
-    auto syncNowPlaying = [&]() {
-        if (hasTracks) {
-            state.musicPlayer.nowPlaying = musicPlayerTrackLabelAt(state.musicPlayer.selectedIndex);
-        } else {
-            state.musicPlayer.nowPlaying = "";
-        }
-    };
+    return false;
+}
 
-    if (isCardKbUpArrowCode(rawCode)) {
-        if (hasTracks) {
-            if (state.musicPlayer.selectedIndex == 0) {
-                state.musicPlayer.selectedIndex = static_cast<uint8_t>(totalCount - 1);
-            } else {
-                --state.musicPlayer.selectedIndex;
-            }
-            syncNowPlaying();
-            state.musicPlayer.statusMessage = "track prev";
-        } else {
-            state.musicPlayer.statusMessage = "no tracks";
+void resetNotesSession(SystemState &state) {
+    state.notes.loaded = false;
+    state.notes.dirty = false;
+    state.notes.statusMessage = "ready";
+    gNotesDraftWord = "";
+    clearNotesTags();
+}
+
+bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode, bool &refreshEink, Stream &out) {
+    refreshEink = false;
+    ensureNotesLoaded(state, out);
+
+    if (isCardKbRightArrowCode(rawCode)) {
+        commitNotesDraftWord(state, false);
+        saveNotes(state, out);
+        refreshEink = true;
+        return true;
+    }
+
+    if (normalizedKey == 8) {
+        if (!gNotesDraftWord.isEmpty()) {
+            gNotesDraftWord.remove(gNotesDraftWord.length() - 1);
+            state.notes.statusMessage = gNotesDraftWord.startsWith("#") ? "typing tag" : "typing";
+        } else if (!gNotesBuffer.isEmpty()) {
+            gNotesBuffer.remove(gNotesBuffer.length() - 1);
+            state.notes.dirty = true;
+            state.notes.statusMessage = "edited";
+            refreshNotesTagsFromBuffer();
+            refreshEink = true;
         }
         return true;
     }
 
-    if (isCardKbDownArrowCode(rawCode)) {
-        if (hasTracks) {
-            state.musicPlayer.selectedIndex = static_cast<uint8_t>((state.musicPlayer.selectedIndex + 1) % totalCount);
-            syncNowPlaying();
-            state.musicPlayer.statusMessage = "track next";
+    if (normalizedKey == ' ') {
+        if (commitNotesDraftWord(state, true)) {
+            state.notes.statusMessage = "word committed";
+            refreshEink = true;
+            return true;
+        }
+
+        state.notes.statusMessage = "typing";
+        return true;
+    }
+
+    if (normalizedKey == '\r' || normalizedKey == '\n') {
+        bool committed = commitNotesDraftWord(state, false);
+        if (gNotesBuffer.length() < kNotesMaxChars) {
+            gNotesBuffer += '\n';
+            state.notes.dirty = true;
+            state.notes.statusMessage = committed ? "line committed" : "new line";
+            refreshEink = true;
         } else {
-            state.musicPlayer.statusMessage = "no tracks";
+            state.notes.statusMessage = "note full";
         }
         return true;
     }
 
-    if (normalizedKey == '1' || normalizedKey == ' ' || normalizedKey == '\r') {
-        state.musicPlayer.playing = !state.musicPlayer.playing;
-        syncNowPlaying();
-        state.musicPlayer.statusMessage = state.musicPlayer.playing ? "playing" : "paused";
-        return true;
-    }
-
-    if (normalizedKey == '2') {
-        if (hasTracks) {
-            state.musicPlayer.selectedIndex = static_cast<uint8_t>((state.musicPlayer.selectedIndex + 1) % totalCount);
-            syncNowPlaying();
-            state.musicPlayer.statusMessage = "next track";
+    if (normalizedKey >= 32 && normalizedKey <= 126 && normalizedKey != ' ') {
+        if (notesTotalChars() < kNotesMaxChars) {
+            gNotesDraftWord += normalizedKey;
+            state.notes.statusMessage = gNotesDraftWord.startsWith("#") ? "typing tag" : "typing";
         } else {
-            state.musicPlayer.statusMessage = "no tracks";
+            state.notes.statusMessage = "note full";
         }
-        return true;
-    }
-
-    if (normalizedKey == '3') {
-        if (hasTracks) {
-            if (state.musicPlayer.selectedIndex == 0) {
-                state.musicPlayer.selectedIndex = static_cast<uint8_t>(totalCount - 1);
-            } else {
-                --state.musicPlayer.selectedIndex;
-            }
-            syncNowPlaying();
-            state.musicPlayer.statusMessage = "previous track";
-        } else {
-            state.musicPlayer.statusMessage = "no tracks";
-        }
-        return true;
-    }
-
-    if (normalizedKey == '4' || normalizedKey == 'r' || normalizedKey == 'R') {
-        invalidateMusicPlayerCache();
-        refreshMusicPlayerLibrary(state, out);
-        if (gMusicTrackCount > 0) {
-            if (state.musicPlayer.selectedIndex >= gMusicTrackCount) {
-                state.musicPlayer.selectedIndex = static_cast<uint8_t>(gMusicTrackCount - 1);
-            }
-            syncNowPlaying();
-        } else {
-            state.musicPlayer.nowPlaying = "";
-        }
-        state.musicPlayer.statusMessage = "library rescan";
         return true;
     }
 
@@ -2435,23 +2666,41 @@ bool handleMusicPlayerAppInput(SystemState &state, char normalizedKey, uint8_t r
 }
 
 bool renderMusicPlayerScreen(SystemState &state, bool oledOnly, Stream &out) {
+    state.musicPlayer.playing = false;
+    state.musicPlayer.nowPlaying = "";
     if (state.musicPlayer.libraryPath.isEmpty()) {
         state.musicPlayer.libraryPath = "/music-player";
     }
-
-    refreshMusicPlayerLibrary(state, out);
-
-    const size_t totalCount = gMusicTrackCount;
-    if (totalCount > 0 && state.musicPlayer.selectedIndex >= totalCount) {
-        state.musicPlayer.selectedIndex = static_cast<uint8_t>(totalCount - 1);
+    if (state.musicPlayer.statusMessage.isEmpty() || state.musicPlayer.statusMessage.equalsIgnoreCase("ready")) {
+        state.musicPlayer.statusMessage = "skeleton mode";
     }
 
-    if (state.musicPlayer.playing && state.musicPlayer.nowPlaying.isEmpty() && totalCount > 0) {
-        state.musicPlayer.nowPlaying = musicPlayerTrackLabelAt(state.musicPlayer.selectedIndex);
-    }
+    return renderStatusScreen(
+        state,
+        "MUSIC PLAYER",
+        "skeleton pripraven",
+        "ceka na druhe ESP",
+        "<- zpet | status: " + state.musicPlayer.statusMessage,
+        oledOnly,
+        out);
+}
 
-    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        drawMusicPlayerOled(state);
+bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out) {
+    ensureNotesLoaded(state, out);
+
+    if (state.oledReady && state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        String charsLine = String("chars: ") + String(static_cast<unsigned>(notesTotalChars())) + (state.notes.dirty ? " *" : "");
+        String draftLine = String("word: ") + (gNotesDraftWord.isEmpty() ? String("(none)") : gNotesDraftWord);
+        String tagsLine = notesTagsSummary(26);
+
+        gOled.clearBuffer();
+        gOled.setFont(u8g2_font_6x10_tf);
+        gOled.drawStr(0, 12, "NOTES");
+        gOled.drawStr(0, 24, charsLine.c_str());
+        gOled.drawStr(0, 36, state.notes.statusMessage.c_str());
+        gOled.drawStr(0, 48, draftLine.c_str());
+        gOled.drawStr(0, 60, tagsLine.c_str());
+        gOled.sendBuffer();
         xSemaphoreGive(state.spiMutex);
     }
 
@@ -2459,19 +2708,19 @@ bool renderMusicPlayerScreen(SystemState &state, bool oledOnly, Stream &out) {
         return state.oledReady;
     }
 
-    if (!ensureEinkInitialized(state, out)) {
-        out.println("OLED: music player rendered");
-        return state.oledReady;
-    }
+    String line1 = String("chars: ") + String(static_cast<unsigned>(gNotesBuffer.length())) + (state.notes.dirty ? " *" : "");
+    String line2 = state.notes.statusMessage + String(" | tags:") + String(static_cast<unsigned>(gNotesTagCount));
+    String line3 = notesTailPreview(28);
+    line3.replace("\n", " ");
 
-    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-        drawMusicPlayerEink(state);
-        xSemaphoreGive(state.spiMutex);
-    }
-
-    markDisplayActivity();
-    out.println("E-ink: music player rendered");
-    return true;
+    return renderStatusScreen(
+        state,
+        "NOTES",
+        line1,
+        line2,
+        line3,
+        oledOnly,
+        out);
 }
 
 bool ensureEinkInitialized(SystemState &state, Stream &out) {
@@ -2898,6 +3147,7 @@ bool renderActiveApp(SystemState &state, bool oledOnly, Stream &out) {
     context.renderSettingsScreen = renderSettingsScreen;
     context.renderFileManagerScreen = renderFileManagerScreen;
     context.renderMusicPlayerScreen = renderMusicPlayerScreen;
+    context.renderNotesScreen = renderNotesScreen;
     context.renderWebUploadScreen = renderWebUploadScreen;
     context.renderPlaceholderApp = renderPlaceholderApp;
     return appRouterRenderActiveApp(state, oledOnly, out, context);
@@ -2940,6 +3190,15 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
         const char musicNormalizedKey = decodeCardKbKey(key);
         if (handleMusicPlayerAppInput(state, musicNormalizedKey, rawCode, out)) {
             renderMusicPlayerScreen(state, false, out);
+            return true;
+        }
+    }
+
+    if (state.launcher.activeAppId.equalsIgnoreCase("notes")) {
+        const char notesNormalizedKey = decodeCardKbKey(key);
+        bool refreshNotesEink = false;
+        if (handleNotesAppInput(state, notesNormalizedKey, rawCode, refreshNotesEink, out)) {
+            renderNotesScreen(state, !refreshNotesEink, out);
             return true;
         }
     }
@@ -3020,6 +3279,8 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
                         fileManagerResetSession(state);
                     } else if (targetId.equalsIgnoreCase("music-player") || targetId.equalsIgnoreCase("sdapp:music-player")) {
                         resetMusicPlayerSession(state);
+                    } else if (targetId.equalsIgnoreCase("notes")) {
+                        resetNotesSession(state);
                     }
                     out.print("Launcher: opening ");
                     out.println(targetId);
@@ -3146,14 +3407,16 @@ void refreshEinkWithCadence(bool forceFull) {
     vTaskDelay(pdMS_TO_TICKS(5));
     ++gEinkUpdateCounter;
 
-    Serial.print("E-ink cadence: ");
-    Serial.print(doFull ? "FULL" : "DU");
-    Serial.print(" update=");
-    Serial.print(gEinkUpdateCounter);
-    Serial.print(" duCount=");
-    Serial.print(gEinkPartialRefreshCounter);
-    Serial.print("/");
-    Serial.println(kEinkFullRefreshInterval - 1);
+    if (kEnableEinkCadenceLogging) {
+        Serial.print("E-ink cadence: ");
+        Serial.print(doFull ? "FULL" : "DU");
+        Serial.print(" update=");
+        Serial.print(gEinkUpdateCounter);
+        Serial.print(" duCount=");
+        Serial.print(gEinkPartialRefreshCounter);
+        Serial.print("/");
+        Serial.println(kEinkFullRefreshInterval - 1);
+    }
 }
 }  // namespace
 

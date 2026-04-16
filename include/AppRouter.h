@@ -11,6 +11,7 @@ struct AppRouterRenderContext {
     bool (*renderSettingsScreen)(SystemState &state, bool oledOnly, Stream &out) = nullptr;
     bool (*renderFileManagerScreen)(SystemState &state, bool oledOnly, Stream &out) = nullptr;
     bool (*renderMusicPlayerScreen)(SystemState &state, bool oledOnly, Stream &out) = nullptr;
+    bool (*renderNotesScreen)(SystemState &state, bool oledOnly, Stream &out) = nullptr;
     bool (*renderWebUploadScreen)(SystemState &state, bool oledOnly, Stream &out) = nullptr;
     bool (*renderPlaceholderApp)(SystemState &state, Stream &out) = nullptr;
 };

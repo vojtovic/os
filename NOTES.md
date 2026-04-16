@@ -162,3 +162,39 @@ Pro tenhle projekt je rozumné začít jednoduše:
 
 ## Poznamka
 Tento projekt je zatim vic "system shell" nez hotovy OS. Cilem je nejdriv mit stabilni architekturu, az pak pridavat funkce.
+
+## Poznamka k AirPods a dual-chip audio (2026-04-10)
+- AirPods audio potrebuje A2DP (Bluetooth Classic/BR-EDR).
+- ESP32-S3 v tomto projektu je BLE-only, proto A2DP na S3 nelze.
+- Doporucena architektura: dual-chip.
+  - ESP32-S3: UI, e-ink/OLED, shell, knihy, ovladani.
+  - ESP32 classic (napr. ESP32-WROOM-32E / DevKitC 38pin): A2DP audio coprocessor.
+
+### Doporuceny hardware k nakupu
+- Vyvojova deska ESP32-DevKitC 38pin s klasickym ESP32 (WROOM-32E) je vhodna pro prototyp.
+- Nepouzivat S3/C3/C6 jako audio cip pro AirPods (chybi Bluetooth Classic).
+
+### Jak spolu budou cipy komunikovat
+- Primarne UART (nejjednodussi MVP).
+- Propojeni:
+  - S3 TX -> ESP32 RX
+  - S3 RX -> ESP32 TX
+  - GND -> GND
+- Doporucene prikazy/protokol (MVP):
+  - `CONNECT <name>`
+  - `PLAY <id|path>`
+  - `PAUSE`
+  - `STOP`
+  - `NEXT`
+  - `STATUS`
+- Odpovedi: `OK`, `ERR <code>`, `STATE <...>`.
+
+### Proc dual-chip dava smysl
+- Hudba muze hrat i pri praci UI (cteni knih, prekreslovani e-ink).
+- Audio je oddeleno od UI zatizeni, mensi riziko preruseni streamu.
+- Lepsi modularita: S3 ridi UX, classic ESP resi Bluetooth audio.
+
+### Dalsi krok po nakupu
+- Pripravit a zapojit UART linku mezi S3 a ESP32 classic.
+- Nasadit minimalni command/status protokol.
+- Otestovat `CONNECT/PLAY/PAUSE/STOP/STATUS` s AirPods.

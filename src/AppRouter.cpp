@@ -35,6 +35,10 @@ bool appRouterRenderActiveApp(
         return context.renderMusicPlayerScreen(state, oledOnly, out);
     }
 
+    if (state.launcher.activeAppId.equalsIgnoreCase("notes")) {
+        return context.renderNotesScreen(state, oledOnly, out);
+    }
+
     if (state.launcher.activeAppId.equalsIgnoreCase("web-upload")) {
         return context.renderWebUploadScreen(state, oledOnly, out);
     }

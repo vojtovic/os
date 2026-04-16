@@ -29,6 +29,13 @@ struct MusicPlayerState {
     bool playing = false;
 };
 
+struct NotesState {
+    String filePath = "/notes/quicknote.txt";
+    String statusMessage = "ready";
+    bool loaded = false;
+    bool dirty = false;
+};
+
 struct SettingsState {
     bool wifiEnabled = false;
     uint8_t lastSelection = 0;
@@ -78,6 +85,7 @@ struct SystemState {
     AppConfig config;
     LauncherState launcher;
     MusicPlayerState musicPlayer;
+    NotesState notes;
     SettingsState settings;
     FileManagerState fileManager;
     NotificationsState notifications;

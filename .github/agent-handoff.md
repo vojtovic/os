@@ -238,6 +238,15 @@ Use this file as the shared context between agents in this workspace.
 ## Stage Status (WiFi Forget Network)
 - Strategy: done, evidence: user requested explicit "forget network" behavior similar to phone UX, next stage: ideas.
 - Ideas: done, evidence: selected low-risk manager action (`3`) with config erase + conditional disconnect for active forgotten SSID, next stage: build.
+
+## Execution Plan (Keyboard Regression Triage)
+1. Strategy: identify whether recent input-path changes could break CardKB handling without changing firmware behavior yet.
+2. Ideas: correlate recent commits touching key decode/routing with known arrow-code variants and app-level input gates.
+3. Verify: provide a ranked list of likely regressions and exact files/functions to inspect first.
+4. Review: report immediate low-risk checks the user can run in serial monitor before code edits.
+
+## Stage Status (Keyboard Regression Triage)
+- Strategy: done, evidence: user reports keyboard non-functional after recent work, next stage: ideas.
 - Build: done, evidence: implemented `settingsServiceForgetWifi` and wired it through settings input context plus OLED/e-ink WiFi manager hints, next stage: verify.
 - Verify: done, evidence: `platformio run` SUCCESS (2026-04-10) after forget-network patch set, next stage: review.
 - Review: done, evidence: connect/scan/toggle paths are unchanged and saved-password prefill remains tied to exact SSID match, next stage: explain.
@@ -260,6 +269,30 @@ Use this file as the shared context between agents in this workspace.
 - Strategy: done, evidence: user reported that Bluetooth still cannot connect in real usage, next stage: build.
 - Build: done, evidence: replaced state-only BT select with real BLE client connect by scanned MAC address and added address persistence (`bt_preferred_address`), next stage: verify.
 - Verify: done, evidence: `platformio run` SUCCESS (2026-04-10) after BLE connect path patch, next stage: on-device smoke test.
+
+## Execution Plan (AirPods A2DP Feasibility on ESP32-S3)
+1. Strategy: validate whether the requested `ESP32-A2DP` + Classic Bluetooth config path is technically possible on current board.
+2. Ideas: compare project Bluetooth flow (BLE client path) with hardware capabilities of ESP32-S3 and A2DP requirements.
+3. Verify: confirm current module behavior and user-facing diagnostics in `AudioManager` and settings Bluetooth connect flow.
+4. Review: document feasible alternatives that preserve boot stability and shell behavior.
+
+## Stage Status (AirPods A2DP Feasibility on ESP32-S3)
+- Strategy: done, evidence: user asked to use `pschatzmann/ESP32-A2DP` with Classic BT/A2DP options for AirPods, next stage: ideas.
+- Ideas: done, evidence: A2DP requires Bluetooth Classic (BR/EDR), but ESP32-S3 controller supports BLE only; menuconfig Classic/A2DP enable path is therefore not available for S3 targets, next stage: verify.
+- Verify: done, evidence: `src/AudioManager.cpp` already reports unsupported A2DP on ESP32-S3 and `src/SettingsConnectivityService.cpp` rejects headset-class usage in BLE mode, next stage: review.
+- Review: done, evidence: project should keep BLE flow on S3 and use classic-capable ESP32 silicon for AirPods/A2DP scenarios, next stage: explain.
+
+## Execution Plan (Dual-Chip Audio Follow-Up)
+1. Strategy: keep ESP32-S3 as UI/system controller and delegate AirPods A2DP to a second classic ESP32.
+2. Ideas: select UART command/status link as MVP transport so integration stays simple and deterministic.
+3. Build: after hardware arrives, add S3-side transport module and classic-ESP audio firmware command handlers.
+4. Verify: run `platformio run` for S3 firmware and perform on-device command loop (`CONNECT/PLAY/PAUSE/STOP/STATUS`).
+5. Review: confirm stable playback during e-ink/book usage and verify no regressions in shell/boot behavior.
+
+## Stage Status (Dual-Chip Audio Follow-Up)
+- Strategy: done, evidence: user wants continuous music while device is used for reading/UI tasks, next stage: ideas.
+- Ideas: done, evidence: chose ESP32-DevKitC 38pin (classic ESP32) as practical audio coprocessor prototype target and UART as first transport, next stage: document and wait for hardware.
+- Explain: done, evidence: saved concrete architecture, purchase guidance, and wiring/protocol notes into `NOTES.md`, next stage: resume implementation once hardware is available.
 
 ## Execution Plan (A2DP Transport Scaffold)
 1. Strategy: add a dedicated A2DP control surface now, then wire SD music app playback later.
@@ -285,6 +318,99 @@ Use this file as the shared context between agents in this workspace.
 - Ideas: done, evidence: selected low-risk renderer extension + `Font8` migration only for e-ink desktop art, next stage: build.
 - Build: done, evidence: patched `epdpaint.cpp` UTF-8 block glyph rendering and updated `DisplayManager.cpp` e-ink desktop art to `Font8` + UTF-8 clipping, next stage: verify.
 - Verify: done, evidence: `platformio run` compiled successfully (2026-04-08) after the block-glyph/Font8 patch, next stage: review on-device readability.
+
+## Execution Plan (AudioManager Safe Refactor)
+1. Strategy: make a behavior-preserving cleanup in `AudioManager` to reduce duplicate unsupported-A2DP state writes.
+2. Ideas: extract one local helper for the common ESP32-S3 unsupported status assignments and reuse in start/stop paths.
+3. Build: patch only `src/AudioManager.cpp` with no public API/signature changes.
+4. Verify: run `platformio run`.
+5. Review: confirm shell messages and persisted target behavior remain unchanged.
+
+## Stage Status (AudioManager Safe Refactor)
+- Strategy: done, evidence: user requested refactor-first workflow before new app design, next stage: ideas.
+- Ideas: done, evidence: selected a local helper extraction to unify unsupported-A2DP state writes without API changes, next stage: build.
+- Build: done, evidence: patched only `src/AudioManager.cpp` with `applyUnsupportedA2dpState(...)` + shared status constant, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after refactor patch, next stage: review.
+- Review: done, evidence: shell text outputs and public AudioManager signatures remain unchanged; target persistence behavior preserved, next stage: optimize.
+- Optimize: done, evidence: reduced duplicate state assignment paths for easier future maintenance with no runtime feature changes, next stage: explain.
+- Explain: done, evidence: refactor complete and ready to continue with new app planning when requested, next stage: user choice.
+
+## Execution Plan (Runtime Log Performance Tuning)
+1. Strategy: reduce serial monitor overhead by disabling high-frequency debug logs while preserving shell and error diagnostics.
+2. Ideas: add local compile-time flags in app loop/task/render paths and default them to low-noise mode.
+3. Build: patch logging callsites only in `AppBootstrap`, `AppTasks`, and e-ink cadence logging path.
+4. Verify: run `platformio run`.
+5. Review: confirm keyboard handling, rendering cadence, and shell command flow remain unchanged.
+
+## Stage Status (Runtime Log Performance Tuning)
+- Strategy: done, evidence: user reported sluggish/jerky serial monitor and asked whether code is optimized for speed, next stage: ideas.
+- Ideas: done, evidence: selected low-risk approach to disable high-frequency non-critical logs via compile-time flags, next stage: build.
+- Build: done, evidence: gated loop heartbeat, CardKB live key logs, task tick logs, and e-ink cadence logs in `AppBootstrap`, `AppTasks`, and `DisplayManager`, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after log-throttling patch set, next stage: review.
+- Review: done, evidence: shell behavior and runtime logic unchanged; only verbose diagnostics frequency reduced, next stage: explain.
+- Explain: done, evidence: firmware now defaults to low-noise serial output for better responsiveness, next stage: optional deeper CPU/latency optimization pass.
+
+## Execution Plan (Music Player Skeleton Mode)
+1. Strategy: keep launcher/router integration for `music-player` but freeze it as a non-functional skeleton until second ESP is available.
+2. Ideas: replace active music-player input/render behavior with a lightweight placeholder-style screen and minimal status updates.
+3. Build: patch only `DisplayManager.cpp` to avoid broad module changes.
+4. Verify: run `platformio run`.
+5. Review: confirm back-navigation and shell/launcher app IDs remain stable.
+
+## Stage Status (Music Player Skeleton Mode)
+- Strategy: done, evidence: user requested to postpone real music app work until second ESP arrives and keep only a skeleton now, next stage: ideas.
+- Ideas: done, evidence: selected low-risk freeze by keeping launcher/router IDs but replacing app behavior with status-only skeleton screen, next stage: build.
+- Build: done, evidence: patched `DisplayManager.cpp` launcher description + music app input/render to skeleton-only mode with no active playback/library logic, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after skeleton-mode patch, next stage: review.
+- Review: done, evidence: global left-arrow back routing and shell `launcher open music-player` path remain unchanged, next stage: explain.
+- Explain: done, evidence: music-player now serves as integrated placeholder until second ESP implementation starts, next stage: choose next app task.
+
+## Execution Plan (Built-in Notes App)
+1. Strategy: add a lightweight Obsidian-like notes MVP directly in firmware with CardKB text input and LittleFS persistence.
+2. Ideas: integrate a new launcher app ID (`notes`) and keep controls minimal: type/edit text, right-arrow save, left-arrow back.
+3. Build: patch router/shell IDs plus `DisplayManager` notes load/save/input/render flow.
+4. Verify: run `platformio run`.
+5. Review: confirm no regressions in launcher navigation and shell app-open behavior.
+
+## Stage Status (Built-in Notes App)
+- Strategy: done, evidence: user requested next built-in app for note-taking (Obsidian-like), next stage: ideas.
+- Ideas: done, evidence: selected safe MVP with one quick-note file in LittleFS and simple controls (type/edit, right-arrow save, left-arrow back), next stage: build.
+- Build: done, evidence: added `notes` app integration across `SystemState`, `AppRouter`, `ShellCommands`, and `DisplayManager` including load/save/input/render path, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after notes app patch set, next stage: review.
+- Review: done, evidence: launcher open/list and back navigation conventions remain stable while notes persistence is contained to LittleFS, next stage: explain.
+- Explain: done, evidence: notes MVP is ready as a built-in firmware app and can be iterated toward richer Obsidian-like behavior later, next stage: optional UX enhancements.
+
+## Execution Plan (Notes Word-Commit E-ink Flow)
+1. Strategy: keep per-key typing feedback on OLED while reducing e-ink updates to committed chunks.
+2. Ideas: introduce a draft-word buffer and refresh e-ink only on space/newline/save events.
+3. Build: patch notes input/render flow in `DisplayManager.cpp` only.
+4. Verify: run `platformio run`.
+5. Review: ensure left-arrow back and right-arrow save behavior remain unchanged.
+
+## Stage Status (Notes Word-Commit E-ink Flow)
+- Strategy: done, evidence: user requested avoiding e-ink updates per letter and committing words on space, next stage: ideas.
+- Ideas: done, evidence: selected draft-word approach with OLED-only typing redraw and conditional e-ink refresh, next stage: build.
+- Build: done, evidence: added `gNotesDraftWord`, word commit helper, and `oledOnly` render switching for notes input handling, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after notes word-commit patch, next stage: review.
+- Review: done, evidence: notes save/back controls preserved while reducing e-ink churn during typing, next stage: explain.
+
+## Execution Plan (Notes Tags MVP)
+1. Strategy: provide Obsidian-like `#tag` usage without heavy editor complexity.
+2. Ideas: parse tags from committed note buffer, track unique tags, and surface them in OLED/e-ink notes UI.
+3. Build: patch `DisplayManager.cpp` notes helpers/input/render only.
+4. Verify: run `platformio run`.
+5. Review: ensure word-commit e-ink behavior remains intact while tags update correctly after edits.
+
+## Stage Status (Notes Tags MVP)
+- Strategy: done, evidence: user requested tag workflow similar to Obsidian, next stage: ideas.
+- Ideas: done, evidence: selected lightweight unique-tag extractor (`#tag`) with draft-tag preview on OLED, next stage: build.
+- Build: done, evidence: added notes tag parser/summary and integrated tag status into notes input/render paths, next stage: verify.
+- Verify: done, evidence: `platformio run` SUCCESS (2026-04-16) after notes tags patch, next stage: review.
+- Review: done, evidence: notes still redraw e-ink only on commit/save events while tags are refreshed on committed-buffer changes, next stage: explain.
+
+## Stage Status (Notes E-ink Text Visibility Fix)
+- Strategy: done, evidence: user reported e-ink no longer shows note words after tags update, next stage: build.
+- Build: done, evidence: adjusted `renderNotesScreen` e-ink lines to render committed note text preview (`notesTailPreview`) instead of tag-summary-only line, next stage: verify.
 - Optimize: done, evidence: added compact UTF-8 draw path with reduced glyph advance (`4px`) and tighter line spacing (`10px`) for e-ink desktop art only, next stage: on-device visual check.
 
 ## Stage Status (Desktop Art Anchor Under Notifications)

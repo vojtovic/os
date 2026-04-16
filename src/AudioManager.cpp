@@ -1,5 +1,17 @@
 #include "AudioManager.h"
 
+namespace {
+constexpr const char *kA2dpUnsupportedStatus = "unsupported on esp32-s3";
+
+void applyUnsupportedA2dpState(SystemState &state, const String &target) {
+    // ESP32-S3 supports BLE only; Bluetooth Classic A2DP source is not available.
+    state.audio.a2dpActive = false;
+    state.audio.a2dpTargetName = target;
+    state.audio.statusMessage = kA2dpUnsupportedStatus;
+    state.config.a2dpTargetName = target;
+}
+}  // namespace
+
 bool startA2dpSource(SystemState &state, const String &targetName, Stream &out) {
     String target = targetName;
     target.trim();
@@ -9,11 +21,7 @@ bool startA2dpSource(SystemState &state, const String &targetName, Stream &out) 
         return false;
     }
 
-    // ESP32-S3 supports BLE only; Bluetooth Classic A2DP source is not available.
-    state.audio.a2dpActive = false;
-    state.audio.a2dpTargetName = target;
-    state.audio.statusMessage = "unsupported on esp32-s3";
-    state.config.a2dpTargetName = target;
+    applyUnsupportedA2dpState(state, target);
 
     out.println("A2DP: unsupported on ESP32-S3 (Bluetooth Classic is not available)");
     out.println("A2DP: use ESP32 (classic) hardware for AirPods/audio output");
@@ -21,8 +29,7 @@ bool startA2dpSource(SystemState &state, const String &targetName, Stream &out) 
 }
 
 bool stopA2dpSource(SystemState &state, Stream &out) {
-    state.audio.a2dpActive = false;
-    state.audio.statusMessage = "unsupported on esp32-s3";
+    applyUnsupportedA2dpState(state, state.audio.a2dpTargetName);
     out.println("A2DP: no-op on ESP32-S3 (unsupported)");
     return true;
 }

@@ -15,6 +15,7 @@ constexpr const char *kLauncherAppIds[] = {
     "settings",
     "file-manager",
     "music-player",
+    "notes",
     "web-upload",
     "apps",
     "serial",
@@ -165,7 +166,7 @@ void printShellHelp(Stream &out) {
     out.println("launcher next");
     out.println("launcher prev");
     out.println("launcher refresh");
-    out.println("launcher open <settings|file-manager|music-player|web-upload|apps|serial|about>");
+    out.println("launcher open <settings|file-manager|music-player|notes|web-upload|apps|serial|about>");
     out.println("launcher list");
     out.println("settings show");
     out.println("oled test");

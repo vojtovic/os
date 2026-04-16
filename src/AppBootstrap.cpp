@@ -8,6 +8,9 @@
 #include "WebUploadManager.h"
 
 namespace {
+constexpr bool kEnableCardKbLiveLogging = false;
+constexpr bool kEnableLoopHeartbeatLogging = false;
+
 String describeCardKbKey(char ch) {
     if (ch == '\r') {
         return "ENTER";
@@ -75,7 +78,9 @@ void processCardKbInput(SystemState &state, Stream &out) {
         renderActiveApp(state, false, out);
     }
 
-    logCardKbInput(ch, out);
+    if (kEnableCardKbLiveLogging) {
+        logCardKbInput(ch, out);
+    }
 
     if (handleActiveAppInput(state, ch, out)) {
         lastKey = ch;
@@ -144,7 +149,7 @@ void setupApplication(SystemState &state, TaskManager &taskManager) {
         testBuzzer(state, Serial, 1);
     }
 
-    if (state.cardKbReady) {
+    if (state.cardKbReady && kEnableCardKbLiveLogging) {
         Serial.println("CardKB live logging: enabled");
     }
 
@@ -154,7 +159,7 @@ void setupApplication(SystemState &state, TaskManager &taskManager) {
 void processApplicationLoop(SystemState &state, TaskManager &taskManager) {
     static uint32_t lastHeartbeatMs = 0;
     const uint32_t nowMs = millis();
-    if (nowMs - lastHeartbeatMs >= 2000) {
+    if (kEnableLoopHeartbeatLogging && nowMs - lastHeartbeatMs >= 2000) {
         Serial.print("loop heartbeat ms=");
         Serial.print(nowMs);
         Serial.print(" core=");
