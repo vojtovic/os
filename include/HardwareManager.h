@@ -10,3 +10,4 @@ void scanI2cBus(Stream &out = Serial);
 void testBuzzer(const SystemState &state, Stream &out = Serial, uint8_t beeps = 2);
 bool tryReadCardKb(SystemState &state, char &ch);
 bool printRtcNow(const SystemState &state, Stream &out = Serial);
+String getRtcTimestamp(const SystemState &state);

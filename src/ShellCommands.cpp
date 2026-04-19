@@ -148,6 +148,7 @@ void printShellHelp(Stream &out) {
     out.println("--- Commands ---");
     out.println("help");
     out.println("info");
+    out.println("fastfetch");
     out.println("tasks");
     out.println("fs info");
     out.println("fs ls [path]");
@@ -205,6 +206,98 @@ bool executeShellCommand(SystemState &state, TaskManager &taskManager, const Str
         out.println(ESP.getCpuFreqMHz());
         out.print("core id: ");
         out.println(xPortGetCoreID());
+        return true;
+    }
+
+    if (line == "fastfetch" || line == "neofetch") {
+        // ASCII art logo
+        out.println("      .--.");
+        out.println("     |o_o |");
+        out.println("     |:_/ |");
+        out.println("    //   \\ \\");
+        out.println("   (|     | )");
+        out.println("  /'\\_   _/`\\");
+        out.println("  \\___)=(___/");
+        out.println();
+
+        // System info
+        out.print(state.config.deviceName);
+        out.println("@esp32s3");
+        out.println("----------------");
+
+        out.println("OS: NoteWave OS");
+
+        out.print("Chip: ESP32-S3 rev ");
+        out.println(ESP.getChipRevision());
+
+        out.print("CPU: Xtensa LX7 x2 @ ");
+        out.print(ESP.getCpuFreqMHz());
+        out.println("MHz");
+
+        out.print("Flash: ");
+        out.print(ESP.getFlashChipSize() / (1024 * 1024));
+        out.print("MB @ ");
+        out.print(ESP.getFlashChipSpeed() / 1000000);
+        out.println("MHz");
+
+        out.print("Heap: ");
+        out.print(ESP.getFreeHeap() / 1024);
+        out.print("K / ");
+        out.print(ESP.getHeapSize() / 1024);
+        out.println("K");
+
+        out.print("Max alloc: ");
+        out.print(ESP.getMaxAllocHeap() / 1024);
+        out.println("K");
+
+        if (ESP.getPsramSize() > 0) {
+            out.print("PSRAM: ");
+            out.print(ESP.getFreePsram() / 1024);
+            out.print("K / ");
+            out.print(ESP.getPsramSize() / 1024);
+            out.println("K");
+        }
+
+        const uint32_t secs = millis() / 1000;
+        const uint32_t mins = secs / 60;
+        const uint32_t hrs = mins / 60;
+        out.print("Uptime: ");
+        if (hrs > 0) {
+            out.print(hrs);
+            out.print("h ");
+        }
+        out.print(mins % 60);
+        out.print("m ");
+        out.print(secs % 60);
+        out.println("s");
+
+        out.print("Display: OLED ");
+        out.print(state.oledReady ? "128x64" : "off");
+        out.print(" + E-ink ");
+        out.println(state.einkReady ? "424x352" : "off");
+
+        out.print("Storage: LittleFS ");
+        out.print(state.littleFsReady ? "ok" : "off");
+        out.print(" | SD ");
+        out.println(state.sdReady ? "ok" : "off");
+
+        out.print("I2C: ");
+        out.print(state.i2cReady ? "ok" : "off");
+        out.print(" | RTC: ");
+        out.print(state.rtcReady ? "ok" : "off");
+        out.print(" | KB: ");
+        out.print(state.cardKbReady ? "ok" : "off");
+        out.print(" | Buzzer: ");
+        out.println(state.buzzerReady ? "ok" : "off");
+
+        // RTC time
+        String rtcTime = getRtcTimestamp(state);
+        if (rtcTime.length() > 0) {
+            out.print("Time: ");
+            out.println(rtcTime);
+        }
+
+        out.println();
         return true;
     }
 

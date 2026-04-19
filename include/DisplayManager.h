@@ -3,6 +3,7 @@
 #include <Arduino.h>
 
 #include "SystemState.h"
+#include "TaskManager.h"
 
 bool initDisplays(SystemState &state, Stream &out = Serial);
 void printDisplayInfo(const SystemState &state, Stream &out = Serial);
@@ -19,3 +20,4 @@ void noteDisplayActivity();
 void invalidateLauncherSdAppCache();
 bool handleEinkIdleTimeout(SystemState &state, Stream &out = Serial);
 bool renderEinkMessage(SystemState &state, const String &text, bool forceFullRefresh = false, Stream &out = Serial);
+void setDesktopTaskManager(TaskManager *tm);

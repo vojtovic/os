@@ -13,6 +13,8 @@
 #include "SettingsInputManager.h"
 #include "WebUploadManager.h"
 #include "StorageManager.h"
+#include "HardwareManager.h"
+#include "ShellCommands.h"
 
 namespace {
 constexpr bool kEnableEinkCadenceLogging = false;
@@ -76,11 +78,16 @@ String gMusicTrackPaths[kMaxMusicTracks];
 size_t gMusicTrackCount = 0;
 bool gMusicCacheDirty = true;
 bool gMusicCachePrimed = false;
-constexpr size_t kNotesMaxChars = 1200;
+constexpr size_t kNotesMaxChars = 4096;
 String gNotesBuffer;
 String gNotesDraftWord;
 constexpr uint8_t kNotesViewRead = 0;
 constexpr uint8_t kNotesViewWrite = 1;
+constexpr uint8_t kNotesViewPicker = 2;
+constexpr size_t kNotesPickerMaxFiles = 20;
+constexpr size_t kNotesPickerVisibleOled = 4;
+String gNotesPickerFiles[kNotesPickerMaxFiles];
+size_t gNotesPickerFileCount = 0;
 constexpr size_t kNotesMaxTags = 16;
 String gNotesTags[kNotesMaxTags];
 size_t gNotesTagCount = 0;
@@ -98,6 +105,87 @@ constexpr uint8_t kNotesScrollBatchThreshold = 2;
 constexpr uint32_t kNotesScrollBatchTimeoutMs = 320;
 constexpr int kNotesTagFilterAll = -1;
 int gNotesActiveTagIndex = kNotesTagFilterAll;
+size_t gNotesCursorPos = 0;
+constexpr size_t kNotesWrapWidthOled = 19;
+constexpr size_t kNotesWrapWidthEink = 51;
+// Undo: single-level snapshot
+String gNotesUndoBuffer;
+size_t gNotesUndoCursorPos = 0;
+bool gNotesUndoAvailable = false;
+// Picker: SD notes support
+constexpr size_t kNotesPickerMaxSdFiles = 20;
+String gNotesPickerSdFiles[kNotesPickerMaxSdFiles];
+size_t gNotesPickerSdFileCount = 0;
+// Picker: rename sub-mode
+constexpr uint8_t kNotesPickerNormal = 0;
+constexpr uint8_t kNotesPickerRename = 1;
+String gNotesRenameBuffer;
+// Auto-save
+constexpr uint32_t kNotesAutoSaveIntervalMs = 30000;
+uint32_t gNotesLastAutoSaveMs = 0;
+// Search (Ctrl+F)
+bool gNotesSearchActive = false;
+String gNotesSearchQuery;
+int gNotesSearchMatchPos = -1;
+// --- Desktop terminal ---
+constexpr size_t kTermMaxLines = 32;
+constexpr size_t kTermVisibleOled = 6;
+constexpr size_t kTermVisibleEink = 12;
+constexpr size_t kTermMaxLineLen = 52;
+String gTermLines[kTermMaxLines];
+size_t gTermLineCount = 0;
+size_t gTermScroll = 0;
+String gTermInputBuffer;
+bool gTermEinkDirty = true;
+TaskManager *gTermTaskManager = nullptr;
+
+// Stream adapter that captures output to a String
+class StringStream : public Stream {
+public:
+    String buffer;
+    size_t write(uint8_t c) override { buffer += static_cast<char>(c); return 1; }
+    size_t write(const uint8_t *buf, size_t size) override {
+        for (size_t i = 0; i < size; ++i) buffer += static_cast<char>(buf[i]);
+        return size;
+    }
+    int available() override { return 0; }
+    int read() override { return -1; }
+    int peek() override { return -1; }
+};
+
+void termAddLine(const String &line) {
+    if (gTermLineCount < kTermMaxLines) {
+        gTermLines[gTermLineCount++] = line;
+    } else {
+        // Shift up
+        for (size_t i = 0; i < kTermMaxLines - 1; ++i) {
+            gTermLines[i] = gTermLines[i + 1];
+        }
+        gTermLines[kTermMaxLines - 1] = line;
+    }
+    // Auto-scroll to bottom
+    if (gTermLineCount > kTermVisibleOled) {
+        gTermScroll = gTermLineCount - kTermVisibleOled;
+    } else {
+        gTermScroll = 0;
+    }
+}
+
+void termAddOutput(const String &output) {
+    // Split output into lines and add each
+    size_t pos = 0;
+    while (pos < output.length()) {
+        int nl = output.indexOf('\n', pos);
+        if (nl < 0) {
+            String line = output.substring(pos);
+            if (line.length() > 0) termAddLine(line);
+            break;
+        }
+        termAddLine(output.substring(pos, nl));
+        pos = nl + 1;
+    }
+}
+
 uint32_t gLastDisplayActivityMs = 0;
 bool gEinkSleeping = false;
 bool gOledSleeping = false;
@@ -163,6 +251,10 @@ void drawMusicPlayerOled(const SystemState &state);
 bool handleMusicPlayerAppInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out);
 bool renderMusicPlayerScreen(SystemState &state, bool oledOnly, Stream &out);
 void resetNotesSession(SystemState &state);
+void notesRefreshPickerFiles(SystemState &state);
+String notesPickerDisplayName(const String &path);
+void notesOpenPickerSelection(SystemState &state, Stream &out);
+void notesCreateNewNote(SystemState &state, Stream &out);
 bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode, bool &refreshEink, Stream &out);
 bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out);
 String notesTailPreview(size_t maxChars);
@@ -173,17 +265,38 @@ bool isNotesEnterKey(char normalizedKey, uint8_t rawCode);
 String notesLineFromEnd(const String &text, size_t fromEnd);
 String notesClipLine(const String &line, size_t maxChars);
 String notesComposeDisplayText(bool writeMode);
+String notesComposeFilteredDisplayText(bool writeMode);
 size_t notesCountLines(const String &text);
 String notesLineAt(const String &text, size_t lineIndex);
 size_t notesMaxScrollLine(const String &text, size_t visibleLines);
 void notesScrollToTail(bool writeMode);
+void notesCursorLineCol(size_t &outLine, size_t &outCol);
+size_t notesLineStartOffset(size_t lineNum);
+size_t notesLineEndOffset(size_t startOff);
+void notesCursorVisualPos(size_t wrapWidth, size_t &outLine, size_t &outCol);
+size_t notesWrappedLineCount(size_t wrapWidth);
+String notesWrappedLineAt(size_t wrapWidth, size_t targetLine);
+size_t notesBufferPosAtVisual(size_t wrapWidth, size_t targetLine, size_t targetCol);
+void notesMoveCursorUp(size_t wrapWidth);
+void notesMoveCursorDown(size_t wrapWidth);
+void notesMoveCursorLeft();
+void notesMoveCursorRight();
+void notesInsertAtCursor(char ch);
+void notesDeleteAtCursor();
+void notesScrollToCursorVisual(size_t visibleLines, size_t wrapWidth);
 uint32_t notesViewportSignature(const String &displayText, bool writeMode, size_t scrollLine);
 uint8_t notesHeadingLevel(const String &line);
 String notesStripHeadingMarkup(const String &line, uint8_t level);
 bool notesFindLastHeading(const String &text, String &headingLine, uint8_t &headingLevel);
 String normalizedNotesPath(SystemState &state);
+bool notesLineContainsTag(const String &line, const String &tag);
 String normalizeMarkdownText(const String &raw);
 bool isOrderedListPrefix(const String &line);
+bool saveNotes(SystemState &state, Stream &out);
+void notesAutoSaveCheck(SystemState &state, Stream &out);
+void notesSearchNext();
+void notesInsertStringAtCursor(const String &s, SystemState &state);
+void notesToggleChecklistAtCursor(SystemState &state);
 
 bool isNotesTagChar(char ch) {
     const uint8_t u = static_cast<uint8_t>(ch);
@@ -443,6 +556,45 @@ String notesComposeDisplayText(bool writeMode) {
     return text;
 }
 
+String notesComposeFilteredDisplayText(bool writeMode) {
+    const String text = notesComposeDisplayText(writeMode);
+    if (writeMode) {
+        return text;
+    }
+
+    const String active = notesActiveTag();
+    if (active.isEmpty()) {
+        return text;
+    }
+
+    String filtered;
+    int start = 0;
+    while (start <= static_cast<int>(text.length())) {
+        int end = text.indexOf('\n', start);
+        if (end < 0) {
+            end = text.length();
+        }
+
+        const String line = text.substring(start, end);
+        if (!line.isEmpty() && notesLineContainsTag(line, active)) {
+            if (!filtered.isEmpty()) {
+                filtered += '\n';
+            }
+            filtered += line;
+        }
+
+        if (end >= static_cast<int>(text.length())) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    if (filtered.isEmpty()) {
+        return String("(no lines for ") + active + String(")");
+    }
+    return filtered;
+}
+
 size_t notesCountLines(const String &text) {
     if (text.isEmpty()) {
         return 1;
@@ -493,6 +645,388 @@ size_t notesMaxScrollLine(const String &text, size_t visibleLines) {
 void notesScrollToTail(bool writeMode) {
     const String text = notesComposeDisplayText(writeMode);
     gNotesScrollLine = notesMaxScrollLine(text, kNotesVisibleLinesEink);
+}
+
+// --- Logical line helpers (for read mode / non-wrapped) ---
+void notesCursorLineCol(size_t &outLine, size_t &outCol) {
+    outLine = 0;
+    outCol = 0;
+    const size_t pos = min(gNotesCursorPos, gNotesBuffer.length());
+    for (size_t i = 0; i < pos; ++i) {
+        if (gNotesBuffer[i] == '\n') {
+            ++outLine;
+            outCol = 0;
+        } else {
+            ++outCol;
+        }
+    }
+}
+
+size_t notesLineStartOffset(size_t lineNum) {
+    if (lineNum == 0) return 0;
+    size_t count = 0;
+    for (size_t i = 0; i < gNotesBuffer.length(); ++i) {
+        if (gNotesBuffer[i] == '\n') {
+            ++count;
+            if (count == lineNum) return i + 1;
+        }
+    }
+    return gNotesBuffer.length();
+}
+
+size_t notesLineEndOffset(size_t startOff) {
+    for (size_t i = startOff; i < gNotesBuffer.length(); ++i) {
+        if (gNotesBuffer[i] == '\n') return i;
+    }
+    return gNotesBuffer.length();
+}
+
+// --- Visual (wrapped) line helpers ---
+
+// Word-wrap helper: given a logical line starting at bufStart up to bufEnd (exclusive),
+// iterate visual lines of at most wrapWidth chars, breaking at last space when possible.
+// Calls visitor(visualLineNum, lineStartBufIdx, lineEndBufIdx) for each visual line.
+// Returns total visual lines produced.
+template <typename Visitor>
+size_t notesWrapLogicalLine(size_t wrapWidth, size_t bufStart, size_t bufEnd, size_t startVisualLine, Visitor visitor) {
+    size_t visualLine = startVisualLine;
+    size_t segStart = bufStart;
+
+    while (segStart < bufEnd) {
+        const size_t remaining = bufEnd - segStart;
+        if (remaining <= wrapWidth) {
+            visitor(visualLine, segStart, bufEnd);
+            return visualLine - startVisualLine + 1;
+        }
+        // Find last space within wrapWidth chars
+        size_t breakAt = segStart + wrapWidth;
+        size_t lastSpace = 0;
+        bool foundSpace = false;
+        for (size_t j = segStart; j < breakAt; ++j) {
+            if (gNotesBuffer[j] == ' ') {
+                lastSpace = j;
+                foundSpace = true;
+            }
+        }
+        size_t lineEnd;
+        if (foundSpace && lastSpace > segStart) {
+            lineEnd = lastSpace + 1; // Include the space, next line starts after it
+        } else {
+            lineEnd = breakAt; // Character wrap fallback
+        }
+        visitor(visualLine, segStart, lineEnd);
+        ++visualLine;
+        segStart = lineEnd;
+    }
+    // Empty logical line
+    if (segStart == bufStart) {
+        visitor(visualLine, segStart, segStart);
+        return 1;
+    }
+    return visualLine - startVisualLine;
+}
+
+// Map cursor buffer position to visual line and column with word wrapping.
+void notesCursorVisualPos(size_t wrapWidth, size_t &outLine, size_t &outCol) {
+    outLine = 0;
+    outCol = 0;
+    const size_t pos = min(gNotesCursorPos, gNotesBuffer.length());
+    size_t visualLine = 0;
+    size_t logStart = 0;
+
+    for (size_t i = 0; i <= gNotesBuffer.length(); ++i) {
+        if (i == gNotesBuffer.length() || gNotesBuffer[i] == '\n') {
+            const size_t logEnd = i;
+            notesWrapLogicalLine(wrapWidth, logStart, logEnd, visualLine,
+                [&](size_t vl, size_t segStart, size_t segEnd) {
+                    if (pos >= segStart && pos <= segEnd) {
+                        // If pos == segEnd and this isn't the last segment of the logical line,
+                        // the cursor is actually at the start of the next visual line
+                        if (pos == segEnd && segEnd < logEnd) {
+                            // Will be caught by next segment
+                        } else {
+                            outLine = vl;
+                            outCol = pos - segStart;
+                        }
+                    }
+                });
+            // Count visual lines for this logical line
+            size_t segStart2 = logStart;
+            size_t vCount = 0;
+            notesWrapLogicalLine(wrapWidth, logStart, logEnd, 0,
+                [&](size_t, size_t, size_t) { ++vCount; });
+            visualLine += vCount;
+            logStart = i + 1;
+            if (i < gNotesBuffer.length() && pos == i) {
+                // Cursor at newline char — end of this logical line
+                // Already handled above
+            }
+        }
+    }
+}
+
+// Count total visual lines with word wrapping.
+size_t notesWrappedLineCount(size_t wrapWidth) {
+    if (gNotesBuffer.isEmpty()) return 1;
+    size_t total = 0;
+    size_t logStart = 0;
+    for (size_t i = 0; i <= gNotesBuffer.length(); ++i) {
+        if (i == gNotesBuffer.length() || gNotesBuffer[i] == '\n') {
+            size_t count = 0;
+            notesWrapLogicalLine(wrapWidth, logStart, i, 0,
+                [&](size_t, size_t, size_t) { ++count; });
+            total += count;
+            logStart = i + 1;
+        }
+    }
+    return total == 0 ? 1 : total;
+}
+
+// Get visual line content at given visual index with word wrapping.
+String notesWrappedLineAt(size_t wrapWidth, size_t targetLine) {
+    size_t visualLine = 0;
+    size_t logStart = 0;
+    String result;
+    bool found = false;
+    for (size_t i = 0; i <= gNotesBuffer.length() && !found; ++i) {
+        if (i == gNotesBuffer.length() || gNotesBuffer[i] == '\n') {
+            notesWrapLogicalLine(wrapWidth, logStart, i, visualLine,
+                [&](size_t vl, size_t segStart, size_t segEnd) {
+                    if (vl == targetLine) {
+                        result = gNotesBuffer.substring(segStart, segEnd);
+                        found = true;
+                    }
+                });
+            size_t count = 0;
+            notesWrapLogicalLine(wrapWidth, logStart, i, 0,
+                [&](size_t, size_t, size_t) { ++count; });
+            visualLine += count;
+            logStart = i + 1;
+        }
+    }
+    return result;
+}
+
+// Find buffer position for a given visual line and column with word wrapping.
+size_t notesBufferPosAtVisual(size_t wrapWidth, size_t targetLine, size_t targetCol) {
+    size_t visualLine = 0;
+    size_t logStart = 0;
+    size_t resultPos = gNotesBuffer.length();
+    bool found = false;
+    for (size_t i = 0; i <= gNotesBuffer.length() && !found; ++i) {
+        if (i == gNotesBuffer.length() || gNotesBuffer[i] == '\n') {
+            notesWrapLogicalLine(wrapWidth, logStart, i, visualLine,
+                [&](size_t vl, size_t segStart, size_t segEnd) {
+                    if (vl == targetLine) {
+                        const size_t segLen = segEnd - segStart;
+                        resultPos = segStart + min(targetCol, segLen);
+                        found = true;
+                    }
+                });
+            size_t count = 0;
+            notesWrapLogicalLine(wrapWidth, logStart, i, 0,
+                [&](size_t, size_t, size_t) { ++count; });
+            visualLine += count;
+            logStart = i + 1;
+        }
+    }
+    return resultPos;
+}
+
+// --- Cursor movement (visual-line aware) ---
+
+void notesMoveCursorUp(size_t wrapWidth) {
+    size_t vLine, vCol;
+    notesCursorVisualPos(wrapWidth, vLine, vCol);
+    if (vLine == 0) return;
+    gNotesCursorPos = notesBufferPosAtVisual(wrapWidth, vLine - 1, vCol);
+}
+
+void notesMoveCursorDown(size_t wrapWidth) {
+    size_t vLine, vCol;
+    notesCursorVisualPos(wrapWidth, vLine, vCol);
+    const size_t totalVisual = notesWrappedLineCount(wrapWidth);
+    if (vLine + 1 >= totalVisual) return;
+    gNotesCursorPos = notesBufferPosAtVisual(wrapWidth, vLine + 1, vCol);
+}
+
+// --- Undo support ---
+void notesSnapshotUndo() {
+    gNotesUndoBuffer = gNotesBuffer;
+    gNotesUndoCursorPos = gNotesCursorPos;
+    gNotesUndoAvailable = true;
+}
+
+void notesRestoreUndo(SystemState &state) {
+    if (!gNotesUndoAvailable) return;
+    gNotesBuffer = gNotesUndoBuffer;
+    gNotesCursorPos = min(gNotesUndoCursorPos, gNotesBuffer.length());
+    gNotesUndoAvailable = false;
+    state.notes.dirty = true;
+    state.notes.statusMessage = "undo";
+}
+
+// --- Auto-save ---
+void notesAutoSaveCheck(SystemState &state, Stream &out) {
+    if (!state.notes.dirty) return;
+    if (state.notes.viewMode == kNotesViewPicker) return;
+    const uint32_t now = millis();
+    if (now - gNotesLastAutoSaveMs >= kNotesAutoSaveIntervalMs) {
+        saveNotes(state, out);
+        gNotesLastAutoSaveMs = now;
+        state.notes.statusMessage = "auto-saved";
+    }
+}
+
+// --- Search ---
+void notesSearchNext() {
+    if (gNotesSearchQuery.length() == 0) {
+        gNotesSearchMatchPos = -1;
+        return;
+    }
+    // Search forward from cursor+1
+    int startPos = static_cast<int>(gNotesCursorPos) + 1;
+    if (startPos >= static_cast<int>(gNotesBuffer.length())) startPos = 0;
+
+    int found = gNotesBuffer.indexOf(gNotesSearchQuery, startPos);
+    if (found < 0 && startPos > 0) {
+        // Wrap around
+        found = gNotesBuffer.indexOf(gNotesSearchQuery, 0);
+    }
+    gNotesSearchMatchPos = found;
+    if (found >= 0) {
+        gNotesCursorPos = static_cast<size_t>(found);
+    }
+}
+
+// --- Insert string at cursor ---
+void notesInsertStringAtCursor(const String &s, SystemState &state) {
+    if (gNotesBuffer.length() + s.length() > kNotesMaxChars) return;
+    notesSnapshotUndo();
+    for (size_t i = 0; i < s.length(); ++i) {
+        notesInsertAtCursor(s.charAt(i));
+    }
+    state.notes.dirty = true;
+}
+
+// --- Checklist toggle ---
+// In write mode, toggles the checkbox on the cursor's line.
+// In read mode, toggles the checkbox on the line at gNotesScrollLine.
+void notesToggleChecklistAtCursor(SystemState &state) {
+    size_t lineStart;
+    if (state.notes.viewMode == kNotesViewWrite) {
+        lineStart = gNotesCursorPos;
+        while (lineStart > 0 && gNotesBuffer.charAt(lineStart - 1) != '\n') {
+            --lineStart;
+        }
+    } else {
+        // Read mode: find start of the line at gNotesScrollLine
+        lineStart = 0;
+        size_t lineNum = 0;
+        for (size_t i = 0; i < gNotesBuffer.length() && lineNum < gNotesScrollLine; ++i) {
+            if (gNotesBuffer.charAt(i) == '\n') ++lineNum;
+            if (lineNum < gNotesScrollLine) continue;
+            lineStart = i + 1;
+        }
+        if (gNotesScrollLine > 0 && lineStart == 0) {
+            // scrollLine beyond buffer
+            state.notes.statusMessage = "no checkbox";
+            return;
+        }
+    }
+    const String rest = gNotesBuffer.substring(lineStart);
+    if (rest.startsWith("- [ ] ")) {
+        notesSnapshotUndo();
+        gNotesBuffer = gNotesBuffer.substring(0, lineStart + 3) + "x" + gNotesBuffer.substring(lineStart + 4);
+        state.notes.dirty = true;
+        state.notes.statusMessage = "checked";
+    } else if (rest.startsWith("- [x] ") || rest.startsWith("- [X] ")) {
+        notesSnapshotUndo();
+        gNotesBuffer = gNotesBuffer.substring(0, lineStart + 3) + " " + gNotesBuffer.substring(lineStart + 4);
+        state.notes.dirty = true;
+        state.notes.statusMessage = "unchecked";
+    } else {
+        state.notes.statusMessage = "no checkbox";
+    }
+}
+
+// --- SD notes picker ---
+void notesRefreshPickerSdFiles(SystemState &state) {
+    gNotesPickerSdFileCount = 0;
+    if (!state.sdReady) return;
+    if (!SD.exists("/notes")) return;
+
+    File dir = SD.open("/notes");
+    if (!dir || !dir.isDirectory()) {
+        dir.close();
+        return;
+    }
+
+    File entry;
+    while ((entry = dir.openNextFile()) && gNotesPickerSdFileCount < kNotesPickerMaxSdFiles) {
+        String name = String(entry.name());
+        if (name.endsWith(".md") || name.endsWith(".txt")) {
+            const int lastSlash = name.lastIndexOf('/');
+            if (lastSlash >= 0) name = name.substring(lastSlash + 1);
+            gNotesPickerSdFiles[gNotesPickerSdFileCount++] = name;
+        }
+        entry.close();
+    }
+    dir.close();
+}
+
+// Total picker file count (LittleFS + SD depending on current view)
+size_t notesPickerCurrentFileCount(const SystemState &state) {
+    return state.notes.pickerShowSd ? gNotesPickerSdFileCount : gNotesPickerFileCount;
+}
+
+const String &notesPickerCurrentFileName(const SystemState &state, size_t idx) {
+    static const String empty;
+    if (state.notes.pickerShowSd) {
+        return idx < gNotesPickerSdFileCount ? gNotesPickerSdFiles[idx] : empty;
+    }
+    return idx < gNotesPickerFileCount ? gNotesPickerFiles[idx] : empty;
+}
+
+String notesPickerCurrentFilePath(const SystemState &state, size_t idx) {
+    if (state.notes.pickerShowSd) {
+        return idx < gNotesPickerSdFileCount ? String("/notes/") + gNotesPickerSdFiles[idx] : String();
+    }
+    return idx < gNotesPickerFileCount ? String("/notes/") + gNotesPickerFiles[idx] : String();
+}
+
+void notesMoveCursorLeft() {
+    if (gNotesCursorPos > 0) --gNotesCursorPos;
+}
+
+void notesMoveCursorRight() {
+    if (gNotesCursorPos < gNotesBuffer.length()) ++gNotesCursorPos;
+}
+
+void notesInsertAtCursor(char ch) {
+    if (gNotesBuffer.length() >= kNotesMaxChars) return;
+    if (gNotesCursorPos >= gNotesBuffer.length()) {
+        gNotesBuffer += ch;
+    } else {
+        gNotesBuffer = gNotesBuffer.substring(0, gNotesCursorPos) + ch + gNotesBuffer.substring(gNotesCursorPos);
+    }
+    ++gNotesCursorPos;
+}
+
+void notesDeleteAtCursor() {
+    if (gNotesCursorPos == 0 || gNotesBuffer.isEmpty()) return;
+    --gNotesCursorPos;
+    gNotesBuffer = gNotesBuffer.substring(0, gNotesCursorPos) + gNotesBuffer.substring(gNotesCursorPos + 1);
+}
+
+void notesScrollToCursorVisual(size_t visibleLines, size_t wrapWidth) {
+    size_t vLine, vCol;
+    notesCursorVisualPos(wrapWidth, vLine, vCol);
+    if (vLine < gNotesScrollLine) {
+        gNotesScrollLine = vLine;
+    } else if (vLine >= gNotesScrollLine + visibleLines) {
+        gNotesScrollLine = vLine - visibleLines + 1;
+    }
 }
 
 uint32_t notesViewportSignature(const String &displayText, bool writeMode, size_t scrollLine) {
@@ -821,19 +1355,27 @@ bool ensureNotesLoaded(SystemState &state, Stream &out) {
     state.notes.loaded = true;
     gNotesBuffer = "";
     gNotesDraftWord = "";
+    gNotesUndoAvailable = false;
     clearNotesTags();
     clearNotesLinks();
 
-    if (!state.littleFsReady) {
+    const bool useSd = state.notes.pickerShowSd;
+    fs::FS &fs = useSd ? static_cast<fs::FS &>(SD) : static_cast<fs::FS &>(LittleFS);
+
+    if (!useSd && !state.littleFsReady) {
         state.notes.statusMessage = "LittleFS off";
+        return false;
+    }
+    if (useSd && !state.sdReady) {
+        state.notes.statusMessage = "SD not ready";
         return false;
     }
 
     String path = normalizedNotesPath(state);
     const String legacyPath = "/notes/quicknote.txt";
 
-    if (!LittleFS.exists(path)) {
-        if (path == "/notes/quicknote.md" && LittleFS.exists(legacyPath)) {
+    if (!fs.exists(path)) {
+        if (!useSd && path == "/notes/quicknote.md" && fs.exists(legacyPath)) {
             path = legacyPath;
             state.notes.statusMessage = "legacy txt loaded";
         } else {
@@ -843,7 +1385,7 @@ bool ensureNotesLoaded(SystemState &state, Stream &out) {
         }
     }
 
-    File file = LittleFS.open(path, "r");
+    File file = fs.open(path, "r");
     if (!file) {
         state.notes.statusMessage = "open failed";
         return false;
@@ -862,6 +1404,7 @@ bool ensureNotesLoaded(SystemState &state, Stream &out) {
 
     state.notes.statusMessage = "loaded";
     state.notes.dirty = false;
+    gNotesCursorPos = gNotesBuffer.length();
     refreshNotesMetadataFromBuffer();
     notesScrollToTail(state.notes.viewMode == kNotesViewWrite);
     gNotesEinkDirty = true;
@@ -869,8 +1412,15 @@ bool ensureNotesLoaded(SystemState &state, Stream &out) {
 }
 
 bool saveNotes(SystemState &state, Stream &out) {
-    if (!state.littleFsReady) {
+    const bool useSd = state.notes.pickerShowSd;
+    fs::FS &fs = useSd ? static_cast<fs::FS &>(SD) : static_cast<fs::FS &>(LittleFS);
+
+    if (!useSd && !state.littleFsReady) {
         state.notes.statusMessage = "LittleFS off";
+        return false;
+    }
+    if (useSd && !state.sdReady) {
+        state.notes.statusMessage = "SD not ready";
         return false;
     }
 
@@ -879,12 +1429,12 @@ bool saveNotes(SystemState &state, Stream &out) {
     const int slash = path.lastIndexOf('/');
     if (slash > 0) {
         const String dir = path.substring(0, slash);
-        if (!LittleFS.exists(dir)) {
-            LittleFS.mkdir(dir);
+        if (!fs.exists(dir)) {
+            fs.mkdir(dir);
         }
     }
 
-    File file = LittleFS.open(path, "w");
+    File file = fs.open(path, "w");
     if (!file) {
         state.notes.statusMessage = "save failed";
         return false;
@@ -1029,8 +1579,12 @@ constexpr uint8_t kFileManagerViewBrowse = 0;
 constexpr uint8_t kFileManagerViewItemMenu = 1;
 constexpr uint8_t kFileManagerViewDirectoryMenu = 2;
 constexpr uint8_t kFileManagerViewCreateFolder = 3;
+constexpr uint8_t kFileManagerViewRename = 4;
+constexpr uint8_t kFileManagerViewPreview = 5;
 constexpr size_t kFileManagerMaxEntries = 24;
 constexpr size_t kFileManagerPageSize = 6;
+constexpr size_t kFileManagerPreviewMaxChars = 512;
+String gFileManagerPreviewBuffer;
 
 String gFileManagerCachedPath;
 bool gFileManagerCacheDirty = true;
@@ -1039,6 +1593,8 @@ String gFileManagerEntryPaths[kFileManagerMaxEntries];
 bool gFileManagerEntryIsDir[kFileManagerMaxEntries];
 uint32_t gFileManagerEntrySizes[kFileManagerMaxEntries];
 size_t gFileManagerEntryCount = 0;
+
+String fileManagerFormatSize(uint32_t bytes);
 
 String fileManagerBaseName(const String &path) {
     int slash = path.lastIndexOf('/');
@@ -1108,8 +1664,17 @@ String fileManagerJoinPath(const String &parentPath, const String &childName) {
     return fileManagerNormalizePath(joined);
 }
 
-bool fileManagerPathExists(const String &path) {
-    return SD.exists(fileManagerNormalizePath(path));
+fs::FS &fileManagerActiveFs(const SystemState &state) {
+    return state.fileManager.browseLittleFs
+        ? static_cast<fs::FS &>(LittleFS) : static_cast<fs::FS &>(SD);
+}
+
+bool fileManagerFsReady(const SystemState &state) {
+    return state.fileManager.browseLittleFs ? state.littleFsReady : state.sdReady;
+}
+
+bool fileManagerPathExists(const SystemState &state, const String &path) {
+    return fileManagerActiveFs(state).exists(fileManagerNormalizePath(path));
 }
 
 void invalidateFileManagerCache() {
@@ -1139,9 +1704,9 @@ bool fileManagerIsInsideSourcePath(const String &sourcePath, const String &desti
     return destinationPath.startsWith(sourcePrefix);
 }
 
-String fileManagerUniqueChildPath(const String &directoryPath, const String &baseName) {
+String fileManagerUniqueChildPath(const SystemState &state, const String &directoryPath, const String &baseName) {
     String candidate = fileManagerJoinPath(directoryPath, baseName);
-    if (!fileManagerPathExists(candidate)) {
+    if (!fileManagerPathExists(state, candidate)) {
         return candidate;
     }
 
@@ -1160,7 +1725,7 @@ String fileManagerUniqueChildPath(const String &directoryPath, const String &bas
         }
         name += extension;
         candidate = fileManagerJoinPath(directoryPath, name);
-        if (!fileManagerPathExists(candidate)) {
+        if (!fileManagerPathExists(state, candidate)) {
             return candidate;
         }
     }
@@ -1168,13 +1733,13 @@ String fileManagerUniqueChildPath(const String &directoryPath, const String &bas
     return String();
 }
 
-bool fileManagerDeleteRecursive(const String &path, Stream &out);
-bool fileManagerCopyRecursive(const String &sourcePath, const String &destinationPath, Stream &out);
+bool fileManagerDeleteRecursive(const SystemState &state, const String &path, Stream &out);
+bool fileManagerCopyRecursive(const SystemState &state, const String &sourcePath, const String &destinationPath, Stream &out);
 
 size_t fileManagerRefreshListing(SystemState &state, Stream &out) {
-    if (!state.sdReady) {
+    if (!fileManagerFsReady(state)) {
         gFileManagerEntryCount = 0;
-        fileManagerSetStatus(state, "SD not ready");
+        fileManagerSetStatus(state, state.fileManager.browseLittleFs ? "LittleFS off" : "SD not ready");
         return 0;
     }
 
@@ -1186,7 +1751,8 @@ size_t fileManagerRefreshListing(SystemState &state, Stream &out) {
     gFileManagerCachedPath = currentPath;
     gFileManagerEntryCount = 0;
 
-    File dir = SD.open(currentPath, FILE_READ);
+    fs::FS &fs = fileManagerActiveFs(state);
+    File dir = fs.open(currentPath, FILE_READ);
     if (!dir || !dir.isDirectory()) {
         fileManagerSetStatus(state, String("open failed: ") + currentPath);
         gFileManagerCacheDirty = false;
@@ -1213,6 +1779,34 @@ size_t fileManagerRefreshListing(SystemState &state, Stream &out) {
     }
 
     dir.close();
+
+    // Sort entries: ".." stays first, then dirs alphabetically, then files alphabetically
+    const size_t sortStart = (currentPath != "/" && gFileManagerEntryCount > 0 && gFileManagerEntryNames[0] == "..") ? 1 : 0;
+    if (gFileManagerEntryCount > sortStart + 1) {
+        for (size_t i = sortStart; i < gFileManagerEntryCount - 1; ++i) {
+            for (size_t j = i + 1; j < gFileManagerEntryCount; ++j) {
+                bool swap = false;
+                if (gFileManagerEntryIsDir[i] == gFileManagerEntryIsDir[j]) {
+                    // Same type: alphabetical (case-insensitive)
+                    String a = gFileManagerEntryNames[i];
+                    String b = gFileManagerEntryNames[j];
+                    a.toLowerCase();
+                    b.toLowerCase();
+                    swap = a > b;
+                } else {
+                    // Dirs before files
+                    swap = !gFileManagerEntryIsDir[i] && gFileManagerEntryIsDir[j];
+                }
+                if (swap) {
+                    std::swap(gFileManagerEntryNames[i], gFileManagerEntryNames[j]);
+                    std::swap(gFileManagerEntryPaths[i], gFileManagerEntryPaths[j]);
+                    std::swap(gFileManagerEntryIsDir[i], gFileManagerEntryIsDir[j]);
+                    std::swap(gFileManagerEntrySizes[i], gFileManagerEntrySizes[j]);
+                }
+            }
+        }
+    }
+
     gFileManagerCacheDirty = false;
     if (gFileManagerEntryCount == 0) {
         fileManagerSetStatus(state, String("empty: ") + currentPath);
@@ -1231,12 +1825,12 @@ bool fileManagerCreateFolder(SystemState &state, const String &folderName, Strea
     cleanName.replace('/', '_');
     cleanName.replace('\\', '_');
     const String targetPath = fileManagerJoinPath(state.fileManager.currentPath, cleanName);
-    if (fileManagerPathExists(targetPath)) {
+    if (fileManagerPathExists(state, targetPath)) {
         fileManagerSetStatus(state, "folder exists");
         return false;
     }
 
-    if (!SD.mkdir(targetPath)) {
+    if (!fileManagerActiveFs(state).mkdir(targetPath)) {
         fileManagerSetStatus(state, "mkdir failed");
         out.print("File manager: mkdir failed ");
         out.println(targetPath);
@@ -1248,14 +1842,15 @@ bool fileManagerCreateFolder(SystemState &state, const String &folderName, Strea
     return true;
 }
 
-bool fileManagerDeleteRecursive(const String &path, Stream &out) {
+bool fileManagerDeleteRecursive(const SystemState &state, const String &path, Stream &out) {
     const String normalized = fileManagerNormalizePath(path);
     if (normalized == "/") {
         out.println("File manager: refusing to delete root");
         return false;
     }
 
-    File entry = SD.open(normalized, FILE_READ);
+    fs::FS &fs = fileManagerActiveFs(state);
+    File entry = fs.open(normalized, FILE_READ);
     if (!entry) {
         out.print("File manager: delete open failed ");
         out.println(normalized);
@@ -1264,7 +1859,7 @@ bool fileManagerDeleteRecursive(const String &path, Stream &out) {
 
     if (!entry.isDirectory()) {
         entry.close();
-        if (!SD.remove(normalized)) {
+        if (!fs.remove(normalized)) {
             out.print("File manager: remove failed ");
             out.println(normalized);
             return false;
@@ -1276,7 +1871,7 @@ bool fileManagerDeleteRecursive(const String &path, Stream &out) {
     while (child) {
         const String childPath = fileManagerJoinPath(normalized, child.name());
         child.close();
-        if (!fileManagerDeleteRecursive(childPath, out)) {
+        if (!fileManagerDeleteRecursive(state, childPath, out)) {
             entry.close();
             return false;
         }
@@ -1284,7 +1879,7 @@ bool fileManagerDeleteRecursive(const String &path, Stream &out) {
     }
 
     entry.close();
-    if (!SD.rmdir(normalized)) {
+    if (!fs.rmdir(normalized)) {
         out.print("File manager: rmdir failed ");
         out.println(normalized);
         return false;
@@ -1293,7 +1888,7 @@ bool fileManagerDeleteRecursive(const String &path, Stream &out) {
     return true;
 }
 
-bool fileManagerCopyRecursive(const String &sourcePath, const String &destinationPath, Stream &out) {
+bool fileManagerCopyRecursive(const SystemState &state, const String &sourcePath, const String &destinationPath, Stream &out) {
     const String normalizedSource = fileManagerNormalizePath(sourcePath);
     const String normalizedDestination = fileManagerNormalizePath(destinationPath);
 
@@ -1302,7 +1897,8 @@ bool fileManagerCopyRecursive(const String &sourcePath, const String &destinatio
         return false;
     }
 
-    File source = SD.open(normalizedSource, FILE_READ);
+    fs::FS &fs = fileManagerActiveFs(state);
+    File source = fs.open(normalizedSource, FILE_READ);
     if (!source) {
         out.print("File manager: copy open failed ");
         out.println(normalizedSource);
@@ -1310,7 +1906,7 @@ bool fileManagerCopyRecursive(const String &sourcePath, const String &destinatio
     }
 
     if (!source.isDirectory()) {
-        File destination = SD.open(normalizedDestination, FILE_WRITE);
+        File destination = fs.open(normalizedDestination, FILE_WRITE);
         if (!destination) {
             source.close();
             out.print("File manager: copy create failed ");
@@ -1338,7 +1934,7 @@ bool fileManagerCopyRecursive(const String &sourcePath, const String &destinatio
         return true;
     }
 
-    if (!SD.mkdir(normalizedDestination)) {
+    if (!fs.mkdir(normalizedDestination)) {
         source.close();
         out.print("File manager: mkdir copy failed ");
         out.println(normalizedDestination);
@@ -1350,7 +1946,7 @@ bool fileManagerCopyRecursive(const String &sourcePath, const String &destinatio
         const String childSource = fileManagerJoinPath(normalizedSource, child.name());
         const String childDestination = fileManagerJoinPath(normalizedDestination, fileManagerBaseName(child.name()));
         child.close();
-        if (!fileManagerCopyRecursive(childSource, childDestination, out)) {
+        if (!fileManagerCopyRecursive(state, childSource, childDestination, out)) {
             source.close();
             return false;
         }
@@ -1372,7 +1968,7 @@ bool fileManagerPasteClipboard(SystemState &state, Stream &out) {
     const String targetDir = fileManagerNormalizePath(state.fileManager.currentPath);
     const String targetPath = state.fileManager.clipboardMove
         ? fileManagerJoinPath(targetDir, sourceName)
-        : fileManagerUniqueChildPath(targetDir, sourceName);
+        : fileManagerUniqueChildPath(state, targetDir, sourceName);
 
     if (targetPath.isEmpty()) {
         fileManagerSetStatus(state, "no free name");
@@ -1388,19 +1984,19 @@ bool fileManagerPasteClipboard(SystemState &state, Stream &out) {
             return true;
         }
 
-        if (fileManagerPathExists(targetPath)) {
+        if (fileManagerPathExists(state, targetPath)) {
             fileManagerSetStatus(state, "target exists");
             return false;
         }
     }
 
-    if (!fileManagerCopyRecursive(sourcePath, targetPath, out)) {
+    if (!fileManagerCopyRecursive(state, sourcePath, targetPath, out)) {
         fileManagerSetStatus(state, "paste failed");
         return false;
     }
 
     if (state.fileManager.clipboardMove) {
-        if (!fileManagerDeleteRecursive(sourcePath, out)) {
+        if (!fileManagerDeleteRecursive(state, sourcePath, out)) {
             fileManagerSetStatus(state, "move cleanup failed");
             return false;
         }
@@ -1445,7 +2041,9 @@ void drawFileManagerOled(const SystemState &state) {
 
     gOled.clearBuffer();
     gOled.setFont(u8g2_font_4x6_tf);
-    gOled.drawStr(0, 7, "FILE MANAGER");
+
+    const String fsTag = state.fileManager.browseLittleFs ? String("[FS] ") : String("[SD] ");
+    gOled.drawStr(0, 7, (fsTag + String("FILE MANAGER")).c_str());
     gOled.setCursor(0, 14);
     gOled.print(state.fileManager.currentPath);
 
@@ -1461,9 +2059,43 @@ void drawFileManagerOled(const SystemState &state) {
         return;
     }
 
+    if (state.fileManager.viewMode == kFileManagerViewRename) {
+        gOled.drawStr(0, 24, "rename");
+        gOled.setCursor(0, 35);
+        gOled.print("name: ");
+        gOled.print(state.fileManager.pendingRenameName);
+        gOled.print('_');
+        gOled.drawStr(0, 48, "enter save");
+        gOled.drawStr(0, 58, "<- cancel");
+        gOled.sendBuffer();
+        return;
+    }
+
+    if (state.fileManager.viewMode == kFileManagerViewPreview) {
+        gOled.drawStr(0, 24, "preview");
+        // Show first ~4 lines of preview
+        int y = 34;
+        size_t pos = 0;
+        for (int i = 0; i < 4 && pos < gFileManagerPreviewBuffer.length(); ++i) {
+            int nl = gFileManagerPreviewBuffer.indexOf('\n', pos);
+            String line;
+            if (nl < 0 || nl > static_cast<int>(pos + 30)) {
+                line = gFileManagerPreviewBuffer.substring(pos, min(pos + 30, gFileManagerPreviewBuffer.length()));
+                pos = (nl >= 0) ? nl + 1 : gFileManagerPreviewBuffer.length();
+            } else {
+                line = gFileManagerPreviewBuffer.substring(pos, nl);
+                pos = nl + 1;
+            }
+            gOled.drawStr(0, y, line.c_str());
+            y += 8;
+        }
+        gOled.drawStr(0, 64, "any key=back");
+        gOled.sendBuffer();
+        return;
+    }
+
     if (state.fileManager.viewMode == kFileManagerViewDirectoryMenu) {
         gOled.drawStr(0, 24, "directory actions");
-        gOled.drawStr(0, 35, state.fileManager.currentPath.c_str());
         gOled.drawStr(0, 46, state.fileManager.menuIndex == 0 ? "> 1 new folder" : "  1 new folder");
         gOled.drawStr(0, 56, state.fileManager.menuIndex == 1 ? "> 2 refresh" : "  2 refresh");
         gOled.drawStr(80, 56, "<- cancel");
@@ -1473,59 +2105,58 @@ void drawFileManagerOled(const SystemState &state) {
 
     if (state.fileManager.viewMode == kFileManagerViewItemMenu) {
         const String targetLabel = fileManagerItemDisplayName(state.fileManager.selectedIndex);
-        gOled.drawStr(0, 24, gFileManagerEntryIsDir[state.fileManager.selectedIndex] ? "folder menu" : "file menu");
-        gOled.setCursor(0, 35);
-        gOled.print(targetLabel);
         const bool isDir = gFileManagerEntryIsDir[state.fileManager.selectedIndex];
-        size_t optionRow = 0;
+        gOled.drawStr(0, 24, isDir ? "folder menu" : "file menu");
+        gOled.setCursor(0, 33);
+        gOled.print(targetLabel);
         if (isDir) {
-            gOled.drawStr(0, 46, state.fileManager.menuIndex == 0 ? "> 1 open" : "  1 open");
-            gOled.drawStr(0, 56, state.fileManager.menuIndex == 1 ? "> 2 delete" : "  2 delete");
-            optionRow = 2;
-            gOled.drawStr(80, 46, state.fileManager.menuIndex == 2 ? "> 3 copy" : "  3 copy");
-            gOled.drawStr(80, 56, state.fileManager.menuIndex == 3 ? "> 4 move" : "  4 move");
+            gOled.drawStr(0, 42, state.fileManager.menuIndex == 0 ? ">open" : " open");
+            gOled.drawStr(30, 42, state.fileManager.menuIndex == 1 ? ">ren" : " ren");
+            gOled.drawStr(55, 42, state.fileManager.menuIndex == 2 ? ">del" : " del");
+            gOled.drawStr(0, 52, state.fileManager.menuIndex == 3 ? ">copy" : " copy");
+            gOled.drawStr(30, 52, state.fileManager.menuIndex == 4 ? ">move" : " move");
         } else {
-            gOled.drawStr(0, 46, state.fileManager.menuIndex == 0 ? "> 1 delete" : "  1 delete");
-            gOled.drawStr(0, 56, state.fileManager.menuIndex == 1 ? "> 2 copy" : "  2 copy");
-            optionRow = 2;
-            gOled.drawStr(80, 46, state.fileManager.menuIndex == 2 ? "> 3 move" : "  3 move");
+            gOled.drawStr(0, 42, state.fileManager.menuIndex == 0 ? ">ren" : " ren");
+            gOled.drawStr(25, 42, state.fileManager.menuIndex == 1 ? ">del" : " del");
+            gOled.drawStr(50, 42, state.fileManager.menuIndex == 2 ? ">copy" : " copy");
+            gOled.drawStr(80, 42, state.fileManager.menuIndex == 3 ? ">move" : " move");
         }
-        (void)optionRow;
         gOled.drawStr(0, 64, "<- cancel");
         gOled.sendBuffer();
         return;
     }
 
+    // --- Browse view ---
     const size_t totalCount = gFileManagerEntryCount;
     const size_t startIndex = min(state.fileManager.scrollOffset, totalCount > kFileManagerPageSize ? totalCount - kFileManagerPageSize : size_t(0));
     const size_t endIndex = min(startIndex + kFileManagerPageSize, totalCount);
-    const size_t pageCount = totalCount == 0 ? 1 : ((totalCount + kFileManagerPageSize - 1) / kFileManagerPageSize);
-    const size_t pageIndex = totalCount == 0 ? 0 : (startIndex / kFileManagerPageSize);
 
-    gOled.drawStr(0, 22, "browse");
-    gOled.setCursor(48, 22);
-    gOled.print(pageIndex + 1);
-    gOled.print("/");
-    gOled.print(pageCount);
+    gOled.setCursor(0, 22);
+    gOled.print(totalCount);
+    gOled.print(" items");
 
     int y = 32;
     for (size_t index = startIndex; index < endIndex; ++index) {
-        String line = (index == state.fileManager.selectedIndex) ? ">" : " ";
-        line += String(static_cast<unsigned>((index - startIndex) + 1));
-        line += " ";
-        line += gFileManagerEntryIsDir[index] ? "[D] " : "[F] ";
+        const bool selected = index == state.fileManager.selectedIndex;
+        String line = selected ? ">" : " ";
+        line += gFileManagerEntryIsDir[index] ? "[D]" : "[F]";
         line += fileManagerItemDisplayName(index);
+        // Truncate name to make room for size
+        if (!gFileManagerEntryIsDir[index] && gFileManagerEntrySizes[index] > 0) {
+            String sizeStr = fileManagerFormatSize(gFileManagerEntrySizes[index]);
+            const size_t nameMaxLen = 26 - sizeStr.length();
+            if (line.length() > nameMaxLen) {
+                line = line.substring(0, nameMaxLen);
+            }
+            while (line.length() < nameMaxLen) line += " ";
+            line += sizeStr;
+        }
         gOled.drawStr(0, y, line.c_str());
         y += 8;
     }
 
-    while (y <= 58) {
-        gOled.drawStr(0, y, "");
-        y += 8;
-    }
-
     gOled.setCursor(0, 64);
-    gOled.print(state.fileManager.clipboardActive ? "right=paste " : "right=new ");
+    gOled.print(state.fileManager.clipboardActive ? "right=paste " : "s=FS p=prev ");
     gOled.print(state.fileManager.statusMessage);
     gOled.sendBuffer();
 }
@@ -1535,17 +2166,43 @@ void drawFileManagerEink(const SystemState &state) {
     prepareLandscapePaint(paint);
     paint.Clear(kUncolored);
     paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
-    paint.DrawStringAt(8, 10, "FILE MANAGER", &Font16, kColored);
+
+    const String fsTag = state.fileManager.browseLittleFs ? String("[LittleFS]") : String("[SD]");
+    String title = fsTag + String(" FILE MANAGER");
+    paint.DrawStringAt(8, 10, title.c_str(), &Font16, kColored);
     paint.DrawStringAtUtf8(8, 26, state.fileManager.currentPath.c_str(), &Font12, kColored);
 
     if (state.fileManager.viewMode == kFileManagerViewCreateFolder) {
         paint.DrawStringAt(8, 48, "new folder", &Font12, kColored);
-        paint.DrawStringAtUtf8(8, 66, state.fileManager.pendingFolderName.c_str(), &Font12, kColored);
-        paint.DrawStringAt(8, 84, "enter=save", &Font12, kColored);
-        paint.DrawStringAt(8, 100, "left=cancel", &Font12, kColored);
+        String nameDisp = String("name: ") + state.fileManager.pendingFolderName + "_";
+        paint.DrawStringAtUtf8(8, 66, nameDisp.c_str(), &Font12, kColored);
+        paint.DrawStringAt(8, 84, "enter=save  left=cancel", &Font12, kColored);
+    } else if (state.fileManager.viewMode == kFileManagerViewRename) {
+        paint.DrawStringAt(8, 48, "rename", &Font12, kColored);
+        String nameDisp = String("name: ") + state.fileManager.pendingRenameName + "_";
+        paint.DrawStringAtUtf8(8, 66, nameDisp.c_str(), &Font12, kColored);
+        paint.DrawStringAt(8, 84, "enter=save  left/esc=cancel", &Font12, kColored);
+    } else if (state.fileManager.viewMode == kFileManagerViewPreview) {
+        paint.DrawStringAt(8, 48, "preview", &Font16, kColored);
+        paint.DrawStringAtUtf8(8, 66, state.fileManager.statusMessage.c_str(), &Font12, kColored);
+        int y = 84;
+        size_t pos = 0;
+        for (int i = 0; i < 8 && pos < gFileManagerPreviewBuffer.length(); ++i) {
+            int nl = gFileManagerPreviewBuffer.indexOf('\n', pos);
+            String line;
+            if (nl < 0 || nl > static_cast<int>(pos + 52)) {
+                line = gFileManagerPreviewBuffer.substring(pos, min(pos + 52, gFileManagerPreviewBuffer.length()));
+                pos = (nl >= 0) ? static_cast<size_t>(nl + 1) : gFileManagerPreviewBuffer.length();
+            } else {
+                line = gFileManagerPreviewBuffer.substring(pos, nl);
+                pos = nl + 1;
+            }
+            paint.DrawStringAtUtf8(8, y, line.c_str(), &Font12, kColored);
+            y += 14;
+        }
+        paint.DrawStringAt(8, 218, "any key = back to browse", &Font12, kColored);
     } else if (state.fileManager.viewMode == kFileManagerViewDirectoryMenu) {
         paint.DrawStringAt(8, 48, "directory actions", &Font12, kColored);
-        paint.DrawStringAtUtf8(8, 66, state.fileManager.currentPath.c_str(), &Font12, kColored);
         paint.DrawStringAt(8, 84, state.fileManager.menuIndex == 0 ? "> 1 new folder" : "  1 new folder", &Font12, kColored);
         paint.DrawStringAt(8, 100, state.fileManager.menuIndex == 1 ? "> 2 refresh" : "  2 refresh", &Font12, kColored);
         paint.DrawStringAt(8, 118, "left=cancel", &Font12, kColored);
@@ -1555,36 +2212,37 @@ void drawFileManagerEink(const SystemState &state) {
         paint.DrawStringAtUtf8(8, 66, fileManagerItemDisplayName(state.fileManager.selectedIndex).c_str(), &Font12, kColored);
         if (isDir) {
             paint.DrawStringAt(8, 84, state.fileManager.menuIndex == 0 ? "> 1 open" : "  1 open", &Font12, kColored);
+            paint.DrawStringAt(8, 100, state.fileManager.menuIndex == 1 ? "> 2 rename" : "  2 rename", &Font12, kColored);
+            paint.DrawStringAt(8, 116, state.fileManager.menuIndex == 2 ? "> 3 delete" : "  3 delete", &Font12, kColored);
+            paint.DrawStringAt(140, 84, state.fileManager.menuIndex == 3 ? "> 4 copy" : "  4 copy", &Font12, kColored);
+            paint.DrawStringAt(140, 100, state.fileManager.menuIndex == 4 ? "> 5 move" : "  5 move", &Font12, kColored);
+        } else {
+            paint.DrawStringAt(8, 84, state.fileManager.menuIndex == 0 ? "> 1 rename" : "  1 rename", &Font12, kColored);
             paint.DrawStringAt(8, 100, state.fileManager.menuIndex == 1 ? "> 2 delete" : "  2 delete", &Font12, kColored);
             paint.DrawStringAt(140, 84, state.fileManager.menuIndex == 2 ? "> 3 copy" : "  3 copy", &Font12, kColored);
             paint.DrawStringAt(140, 100, state.fileManager.menuIndex == 3 ? "> 4 move" : "  4 move", &Font12, kColored);
-        } else {
-            paint.DrawStringAt(8, 84, state.fileManager.menuIndex == 0 ? "> 1 delete" : "  1 delete", &Font12, kColored);
-            paint.DrawStringAt(8, 100, state.fileManager.menuIndex == 1 ? "> 2 copy" : "  2 copy", &Font12, kColored);
-            paint.DrawStringAt(140, 84, state.fileManager.menuIndex == 2 ? "> 3 move" : "  3 move", &Font12, kColored);
         }
-        paint.DrawStringAt(8, 118, "left=cancel", &Font12, kColored);
+        paint.DrawStringAt(8, 134, "left=cancel", &Font12, kColored);
     } else {
+        // --- Browse view ---
         const size_t totalCount = gFileManagerEntryCount;
         const size_t startIndex = min(state.fileManager.scrollOffset, totalCount > kFileManagerPageSize ? totalCount - kFileManagerPageSize : size_t(0));
         const size_t endIndex = min(startIndex + kFileManagerPageSize, totalCount);
-        const size_t pageCount = totalCount == 0 ? 1 : ((totalCount + kFileManagerPageSize - 1) / kFileManagerPageSize);
-        const size_t pageIndex = totalCount == 0 ? 0 : (startIndex / kFileManagerPageSize);
-        String pageLine = String("page ") + String(static_cast<unsigned>(pageIndex + 1)) + "/" + String(static_cast<unsigned>(pageCount));
-        paint.DrawStringAt(200, 26, pageLine.c_str(), &Font12, kColored);
+        String countLine = String(static_cast<unsigned>(totalCount)) + " items";
+        paint.DrawStringAt(200, 26, countLine.c_str(), &Font12, kColored);
         paint.DrawLine(0, 38, kEinkLandscapeWidth - 1, 38, kColored);
 
         int y = 48;
         for (size_t index = startIndex; index < endIndex; ++index) {
-            String line = String(static_cast<unsigned>((index - startIndex) + 1));
-            line += ".";
+            const bool selected = index == state.fileManager.selectedIndex;
+            String line = selected ? String("> ") : String("  ");
             line += gFileManagerEntryIsDir[index] ? "[D] " : "[F] ";
             line += fileManagerItemDisplayName(index);
-            if (index == state.fileManager.selectedIndex) {
-                line = String("> ") + line;
-            } else {
-                line = String("  ") + line;
+            // Append file size for files
+            if (!gFileManagerEntryIsDir[index] && gFileManagerEntrySizes[index] > 0) {
+                line += String("  ") + fileManagerFormatSize(gFileManagerEntrySizes[index]);
             }
+            line = notesClipLine(line, 52);
             paint.DrawStringAtUtf8(8, y, line.c_str(), &Font12, kColored);
             y += 16;
         }
@@ -1593,7 +2251,7 @@ void drawFileManagerEink(const SystemState &state) {
             paint.DrawStringAt(8, 58, "empty directory", &Font12, kColored);
         }
 
-        paint.DrawStringAt(8, 218, state.fileManager.clipboardActive ? "1..6 open/menu, up/down page, right=paste" : "1..6 open/menu, up/down page, right=new", &Font12, kColored);
+        paint.DrawStringAt(8, 218, "up/dn=nav enter=open s=FS p=preview right=menu", &Font12, kColored);
     }
 
     gEink.display(paint.GetImage());
@@ -1627,7 +2285,7 @@ bool fileManagerExecuteSelection(SystemState &state, Stream &out) {
                 }
                 return false;
             case 1:
-                if (fileManagerDeleteRecursive(selectedPath, out)) {
+                if (fileManagerDeleteRecursive(state, selectedPath, out)) {
                     invalidateFileManagerCache();
                     fileManagerRefreshListing(state, out);
                     fileManagerSetStatus(state, String("deleted ") + fileManagerItemDisplayName(state.fileManager.selectedIndex));
@@ -1654,7 +2312,7 @@ bool fileManagerExecuteSelection(SystemState &state, Stream &out) {
 
     switch (state.fileManager.menuIndex) {
         case 0:
-            if (fileManagerDeleteRecursive(selectedPath, out)) {
+            if (fileManagerDeleteRecursive(state, selectedPath, out)) {
                 invalidateFileManagerCache();
                 fileManagerRefreshListing(state, out);
                 fileManagerSetStatus(state, String("deleted ") + fileManagerItemDisplayName(state.fileManager.selectedIndex));
@@ -1679,26 +2337,53 @@ bool fileManagerExecuteSelection(SystemState &state, Stream &out) {
     }
 }
 
+String fileManagerFormatSize(uint32_t bytes) {
+    if (bytes < 1024) return String(bytes) + "B";
+    if (bytes < 1024 * 1024) return String(bytes / 1024) + "K";
+    return String(bytes / (1024 * 1024)) + "M";
+}
+
+void fileManagerLoadPreview(const SystemState &state, const String &path) {
+    gFileManagerPreviewBuffer = "";
+    fs::FS &fs = fileManagerActiveFs(state);
+    File f = fs.open(path, FILE_READ);
+    if (!f || f.isDirectory()) {
+        gFileManagerPreviewBuffer = "(cannot preview)";
+        if (f) f.close();
+        return;
+    }
+    while (f.available() && gFileManagerPreviewBuffer.length() < kFileManagerPreviewMaxChars) {
+        gFileManagerPreviewBuffer += static_cast<char>(f.read());
+    }
+    f.close();
+    if (gFileManagerPreviewBuffer.length() == 0) {
+        gFileManagerPreviewBuffer = "(empty file)";
+    }
+}
+
 bool fileManagerHandleBrowseInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out) {
     const size_t totalCount = gFileManagerEntryCount;
-    const size_t pageCount = totalCount == 0 ? 1 : ((totalCount + kFileManagerPageSize - 1) / kFileManagerPageSize);
 
+    // Item-by-item navigation
     if (isCardKbUpArrowCode(rawCode)) {
-        if (state.fileManager.scrollOffset >= kFileManagerPageSize) {
-            state.fileManager.scrollOffset -= kFileManagerPageSize;
-        } else {
-            state.fileManager.scrollOffset = 0;
+        if (totalCount > 0 && state.fileManager.selectedIndex > 0) {
+            --state.fileManager.selectedIndex;
+            // Scroll up if needed
+            if (state.fileManager.selectedIndex < state.fileManager.scrollOffset) {
+                state.fileManager.scrollOffset = state.fileManager.selectedIndex;
+            }
         }
-        state.fileManager.selectedIndex = static_cast<uint8_t>(state.fileManager.scrollOffset);
-        fileManagerSetStatus(state, "page up");
         return true;
     }
 
-    if (isCardKbDownArrowCode(rawCode) && pageCount > 1) {
-        const size_t maxOffset = totalCount > kFileManagerPageSize ? totalCount - kFileManagerPageSize : 0;
-        state.fileManager.scrollOffset = min(state.fileManager.scrollOffset + kFileManagerPageSize, maxOffset);
-        state.fileManager.selectedIndex = static_cast<uint8_t>(state.fileManager.scrollOffset);
-        fileManagerSetStatus(state, "page down");
+    if (isCardKbDownArrowCode(rawCode)) {
+        if (totalCount > 0 && state.fileManager.selectedIndex < static_cast<uint8_t>(totalCount - 1)) {
+            ++state.fileManager.selectedIndex;
+            // Scroll down if needed
+            if (state.fileManager.selectedIndex >= state.fileManager.scrollOffset + kFileManagerPageSize) {
+                state.fileManager.scrollOffset = state.fileManager.selectedIndex - kFileManagerPageSize + 1;
+            }
+        }
         return true;
     }
 
@@ -1717,6 +2402,25 @@ bool fileManagerHandleBrowseInput(SystemState &state, char normalizedKey, uint8_
         return true;
     }
 
+    // Enter: open dir directly, or open item menu for files
+    if (normalizedKey == '\r' || normalizedKey == '\n') {
+        if (totalCount > 0 && state.fileManager.selectedIndex < totalCount) {
+            const size_t idx = state.fileManager.selectedIndex;
+            if (gFileManagerEntryIsDir[idx]) {
+                fileManagerEnterDirectory(state, fileManagerItemPath(idx), out);
+                return true;
+            }
+            state.fileManager.viewMode = kFileManagerViewItemMenu;
+            state.fileManager.menuIndex = 0;
+            state.fileManager.menuTargetPath = fileManagerItemPath(idx);
+            state.fileManager.menuTargetIsDir = false;
+            fileManagerSetStatus(state, fileManagerItemDisplayName(idx));
+            return true;
+        }
+        return true;
+    }
+
+    // Number keys: quick-select items on current page
     if (normalizedKey >= '1' && normalizedKey <= '6') {
         const size_t localIndex = static_cast<size_t>(normalizedKey - '1');
         const size_t absoluteIndex = state.fileManager.scrollOffset + localIndex;
@@ -1726,34 +2430,53 @@ bool fileManagerHandleBrowseInput(SystemState &state, char normalizedKey, uint8_
             state.fileManager.menuIndex = 0;
             state.fileManager.menuTargetPath = fileManagerItemPath(absoluteIndex);
             state.fileManager.menuTargetIsDir = gFileManagerEntryIsDir[absoluteIndex];
-            fileManagerSetStatus(state, String("selected ") + fileManagerItemDisplayName(absoluteIndex));
+            fileManagerSetStatus(state, fileManagerItemDisplayName(absoluteIndex));
             return true;
         }
     }
 
-    if (normalizedKey == '\r' || normalizedKey == '\n') {
-        fileManagerSetStatus(state, "pick 1..6 or arrow keys");
+    // s: toggle SD / LittleFS
+    if (normalizedKey == 's' || normalizedKey == 'S') {
+        state.fileManager.browseLittleFs = !state.fileManager.browseLittleFs;
+        state.fileManager.currentPath = "/";
+        fileManagerResetBrowseSelection(state);
+        invalidateFileManagerCache();
+        fileManagerRefreshListing(state, out);
+        fileManagerSetStatus(state, state.fileManager.browseLittleFs ? "LittleFS" : "SD card");
+        return true;
+    }
+
+    // p: preview selected file
+    if (normalizedKey == 'p' || normalizedKey == 'P') {
+        if (totalCount > 0 && state.fileManager.selectedIndex < totalCount
+            && !gFileManagerEntryIsDir[state.fileManager.selectedIndex]) {
+            fileManagerLoadPreview(state, fileManagerItemPath(state.fileManager.selectedIndex));
+            state.fileManager.viewMode = kFileManagerViewPreview;
+            fileManagerSetStatus(state, fileManagerItemDisplayName(state.fileManager.selectedIndex));
+            return true;
+        }
+        fileManagerSetStatus(state, "select a file");
         return true;
     }
 
     if (normalizedKey >= 32 && normalizedKey <= 126) {
-        fileManagerSetStatus(state, String("key: ") + normalizedKey);
-        return true;
+        return true; // consume silently
     }
 
     return false;
 }
 
+// Item menu options:
+// Dir:  0=open, 1=rename, 2=delete, 3=copy, 4=move
+// File: 0=rename, 1=delete, 2=copy, 3=move
 bool fileManagerHandleItemMenuInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out) {
     const bool isDir = state.fileManager.menuTargetIsDir;
-    const uint8_t optionCount = isDir ? 4 : 3;
+    const uint8_t optionCount = isDir ? 5 : 4;
 
     if (isCardKbUpArrowCode(rawCode)) {
-        if (state.fileManager.menuIndex == 0) {
-            state.fileManager.menuIndex = optionCount - 1;
-        } else {
-            --state.fileManager.menuIndex;
-        }
+        state.fileManager.menuIndex = state.fileManager.menuIndex == 0
+            ? optionCount - 1
+            : state.fileManager.menuIndex - 1;
         return true;
     }
 
@@ -1763,16 +2486,29 @@ bool fileManagerHandleItemMenuInput(SystemState &state, char normalizedKey, uint
     }
 
     if (normalizedKey == '\r' || normalizedKey == '\n') {
-        if (state.fileManager.menuIndex == 0 && isDir) {
+        // Dir: open
+        if (isDir && state.fileManager.menuIndex == 0) {
             fileManagerEnterDirectory(state, state.fileManager.menuTargetPath, out);
             return true;
         }
 
-        if (state.fileManager.menuIndex == (isDir ? 1 : 0)) {
-            if (fileManagerDeleteRecursive(state.fileManager.menuTargetPath, out)) {
+        const uint8_t renameIdx = isDir ? 1 : 0;
+        const uint8_t deleteIdx = isDir ? 2 : 1;
+        const uint8_t copyIdx = isDir ? 3 : 2;
+        const uint8_t moveIdx = isDir ? 4 : 3;
+
+        if (state.fileManager.menuIndex == renameIdx) {
+            state.fileManager.viewMode = kFileManagerViewRename;
+            state.fileManager.pendingRenameName = fileManagerBaseName(state.fileManager.menuTargetPath);
+            fileManagerSetStatus(state, "type new name");
+            return true;
+        }
+
+        if (state.fileManager.menuIndex == deleteIdx) {
+            if (fileManagerDeleteRecursive(state, state.fileManager.menuTargetPath, out)) {
                 invalidateFileManagerCache();
                 fileManagerRefreshListing(state, out);
-                fileManagerSetStatus(state, "deleted item");
+                fileManagerSetStatus(state, "deleted");
                 state.fileManager.viewMode = kFileManagerViewBrowse;
                 return true;
             }
@@ -1780,7 +2516,7 @@ bool fileManagerHandleItemMenuInput(SystemState &state, char normalizedKey, uint
             return true;
         }
 
-        if (state.fileManager.menuIndex == (isDir ? 2 : 1)) {
+        if (state.fileManager.menuIndex == copyIdx) {
             state.fileManager.clipboardPath = state.fileManager.menuTargetPath;
             state.fileManager.clipboardMove = false;
             state.fileManager.clipboardActive = true;
@@ -1789,7 +2525,7 @@ bool fileManagerHandleItemMenuInput(SystemState &state, char normalizedKey, uint
             return true;
         }
 
-        if (state.fileManager.menuIndex == (isDir ? 3 : 2)) {
+        if (state.fileManager.menuIndex == moveIdx) {
             state.fileManager.clipboardPath = state.fileManager.menuTargetPath;
             state.fileManager.clipboardMove = true;
             state.fileManager.clipboardActive = true;
@@ -1804,11 +2540,11 @@ bool fileManagerHandleItemMenuInput(SystemState &state, char normalizedKey, uint
     if (isCardKbLeftArrowCode(rawCode)) {
         state.fileManager.viewMode = kFileManagerViewBrowse;
         state.fileManager.menuIndex = 0;
-        fileManagerSetStatus(state, "menu canceled");
+        fileManagerSetStatus(state, "canceled");
         return true;
     }
 
-    if (normalizedKey >= '1' && normalizedKey <= '4') {
+    if (normalizedKey >= '1' && normalizedKey <= '5') {
         state.fileManager.menuIndex = static_cast<uint8_t>(normalizedKey - '1');
         return true;
     }
@@ -1891,15 +2627,83 @@ bool fileManagerHandleCreateFolderInput(SystemState &state, char normalizedKey, 
     return false;
 }
 
+bool fileManagerHandleRenameInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out) {
+    if (isCardKbLeftArrowCode(rawCode) || static_cast<uint8_t>(normalizedKey) == 0x1B) {
+        state.fileManager.viewMode = kFileManagerViewBrowse;
+        state.fileManager.pendingRenameName = "";
+        fileManagerSetStatus(state, "rename canceled");
+        return true;
+    }
+
+    if (normalizedKey == '\r' || normalizedKey == '\n') {
+        String newName = state.fileManager.pendingRenameName;
+        newName.trim();
+        if (newName.isEmpty()) {
+            fileManagerSetStatus(state, "name empty");
+            return true;
+        }
+        const String parentDir = fileManagerParentPath(state.fileManager.menuTargetPath);
+        const String newPath = fileManagerJoinPath(parentDir, newName);
+        if (fileManagerPathExists(state, newPath)) {
+            fileManagerSetStatus(state, "name exists");
+            return true;
+        }
+        fs::FS &fs = fileManagerActiveFs(state);
+        if (fs.rename(state.fileManager.menuTargetPath, newPath)) {
+            invalidateFileManagerCache();
+            fileManagerRefreshListing(state, out);
+            fileManagerSetStatus(state, String("renamed ") + newName);
+            out.print("FM: renamed to ");
+            out.println(newPath);
+        } else {
+            fileManagerSetStatus(state, "rename failed");
+        }
+        state.fileManager.viewMode = kFileManagerViewBrowse;
+        state.fileManager.pendingRenameName = "";
+        return true;
+    }
+
+    if (normalizedKey == 8 || normalizedKey == 127) {
+        if (!state.fileManager.pendingRenameName.isEmpty()) {
+            state.fileManager.pendingRenameName.remove(state.fileManager.pendingRenameName.length() - 1);
+        }
+        return true;
+    }
+
+    if (normalizedKey >= 32 && normalizedKey <= 126) {
+        if (normalizedKey != '/' && normalizedKey != '\\') {
+            if (state.fileManager.pendingRenameName.length() < 32) {
+                state.fileManager.pendingRenameName += normalizedKey;
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+bool fileManagerHandlePreviewInput(SystemState &state, char normalizedKey, uint8_t rawCode, Stream &out) {
+    (void)out;
+    // Any key exits preview
+    (void)normalizedKey;
+    (void)rawCode;
+    state.fileManager.viewMode = kFileManagerViewBrowse;
+    gFileManagerPreviewBuffer = "";
+    fileManagerSetStatus(state, "browse");
+    return true;
+}
+
 void fileManagerResetSession(SystemState &state) {
     state.fileManager.currentPath = "/";
     state.fileManager.statusMessage = "ready";
     state.fileManager.clipboardPath = "";
     state.fileManager.menuTargetPath = "";
     state.fileManager.pendingFolderName = "";
+    state.fileManager.pendingRenameName = "";
     state.fileManager.clipboardActive = false;
     state.fileManager.clipboardMove = false;
     state.fileManager.menuTargetIsDir = false;
+    state.fileManager.browseLittleFs = false;
     state.fileManager.viewMode = kFileManagerViewBrowse;
     state.fileManager.selectedIndex = 0;
     state.fileManager.scrollOffset = 0;
@@ -1916,6 +2720,20 @@ bool fileManagerHandleBackInput(SystemState &state, uint8_t rawCode, Stream &out
         state.fileManager.viewMode = kFileManagerViewBrowse;
         state.fileManager.pendingFolderName = "";
         fileManagerSetStatus(state, "create canceled");
+        return true;
+    }
+
+    if (state.fileManager.viewMode == kFileManagerViewRename) {
+        state.fileManager.viewMode = kFileManagerViewBrowse;
+        state.fileManager.pendingRenameName = "";
+        fileManagerSetStatus(state, "rename canceled");
+        return true;
+    }
+
+    if (state.fileManager.viewMode == kFileManagerViewPreview) {
+        state.fileManager.viewMode = kFileManagerViewBrowse;
+        gFileManagerPreviewBuffer = "";
+        fileManagerSetStatus(state, "browse");
         return true;
     }
 
@@ -1939,6 +2757,14 @@ bool fileManagerHandleBackInput(SystemState &state, uint8_t rawCode, Stream &out
 
 bool handleFileManagerAppInput(SystemState &state, char key, char normalizedKey, uint8_t rawCode, Stream &out) {
     (void)key;
+
+    if (state.fileManager.viewMode == kFileManagerViewRename) {
+        return fileManagerHandleRenameInput(state, normalizedKey, rawCode, out);
+    }
+
+    if (state.fileManager.viewMode == kFileManagerViewPreview) {
+        return fileManagerHandlePreviewInput(state, normalizedKey, rawCode, out);
+    }
 
     if (state.fileManager.viewMode == kFileManagerViewItemMenu) {
         return fileManagerHandleItemMenuInput(state, normalizedKey, rawCode, out);
@@ -3196,27 +4022,370 @@ bool handleMusicPlayerAppInput(SystemState &state, char normalizedKey, uint8_t r
 void resetNotesSession(SystemState &state) {
     state.notes.loaded = false;
     state.notes.dirty = false;
-    state.notes.statusMessage = "ready";
+    state.notes.statusMessage = "select note";
+    state.notes.viewMode = kNotesViewPicker;
+    state.notes.pickerIndex = 0;
+    state.notes.pickerScroll = 0;
+    state.notes.pickerSubMode = kNotesPickerNormal;
+    state.notes.pickerShowSd = false;
+    gNotesScrollLine = 0;
+    gNotesScrollBatchSteps = 0;
+    gNotesEinkDirty = true;
+    gNotesDraftWord = "";
+    gNotesUndoAvailable = false;
+    gNotesRenameBuffer = "";
+    clearNotesTags();
+    clearNotesLinks();
+    notesRefreshPickerFiles(state);
+    notesRefreshPickerSdFiles(state);
+}
+
+void notesRefreshPickerFiles(SystemState &state) {
+    gNotesPickerFileCount = 0;
+    if (!state.littleFsReady) return;
+
+    File dir = LittleFS.open("/notes");
+    if (!dir || !dir.isDirectory()) {
+        dir.close();
+        return;
+    }
+
+    File entry;
+    while ((entry = dir.openNextFile()) && gNotesPickerFileCount < kNotesPickerMaxFiles) {
+        String name = String(entry.name());
+        if (name.endsWith(".md") || name.endsWith(".txt")) {
+            // entry.name() may return full path; store just the filename
+            const int lastSlash = name.lastIndexOf('/');
+            if (lastSlash >= 0) {
+                name = name.substring(lastSlash + 1);
+            }
+            gNotesPickerFiles[gNotesPickerFileCount++] = name;
+        }
+        entry.close();
+    }
+    dir.close();
+}
+
+String notesPickerDisplayName(const String &path) {
+    const int lastSlash = path.lastIndexOf('/');
+    String name = lastSlash >= 0 ? path.substring(lastSlash + 1) : path;
+    // Strip .md extension for display
+    if (name.endsWith(".md")) {
+        name = name.substring(0, name.length() - 3);
+    } else if (name.endsWith(".txt")) {
+        name = name.substring(0, name.length() - 4);
+    }
+    return name;
+}
+
+void notesOpenPickerSelection(SystemState &state, Stream &out) {
+    const size_t count = notesPickerCurrentFileCount(state);
+    if (count == 0) return;
+    const size_t idx = state.notes.pickerIndex;
+    if (idx >= count) return;
+
+    // Save current note if dirty
+    if (state.notes.dirty || !gNotesDraftWord.isEmpty()) {
+        commitNotesDraftWord(state, false);
+        saveNotes(state, out);
+    }
+
+    state.notes.filePath = notesPickerCurrentFilePath(state, idx);
+    state.notes.loaded = false;
+    state.notes.dirty = false;
     state.notes.viewMode = kNotesViewWrite;
     gNotesScrollLine = 0;
     gNotesScrollBatchSteps = 0;
     gNotesEinkDirty = true;
     gNotesDraftWord = "";
+    gNotesCursorPos = 0; // Will be set to end after load
     clearNotesTags();
     clearNotesLinks();
+    state.notes.statusMessage = "opened";
+}
+
+void notesCreateNewNote(SystemState &state, Stream &out) {
+    if (!state.littleFsReady) {
+        state.notes.statusMessage = "LittleFS off";
+        return;
+    }
+
+    // Find next available untitled-N.md
+    if (!LittleFS.exists("/notes")) {
+        LittleFS.mkdir("/notes");
+    }
+
+    for (int n = 1; n <= 99; ++n) {
+        String name = String("untitled-") + String(n) + String(".md");
+        String path = String("/notes/") + name;
+        if (!LittleFS.exists(path)) {
+            // Save current note first
+            if (state.notes.dirty || !gNotesDraftWord.isEmpty()) {
+                commitNotesDraftWord(state, false);
+                saveNotes(state, out);
+            }
+
+            state.notes.filePath = path;
+            state.notes.loaded = true;
+            state.notes.dirty = false;
+            state.notes.viewMode = kNotesViewWrite;
+            gNotesBuffer = "";
+            gNotesDraftWord = "";
+            gNotesCursorPos = 0;
+            gNotesScrollLine = 0;
+            gNotesEinkDirty = true;
+            clearNotesTags();
+            clearNotesLinks();
+            state.notes.statusMessage = "new note";
+            out.print("Notes: created ");
+            out.println(path);
+            return;
+        }
+    }
+
+    state.notes.statusMessage = "too many notes";
 }
 
 bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode, bool &refreshEink, Stream &out) {
     refreshEink = false;
+
+    // --- Picker mode ---
+    if (state.notes.viewMode == kNotesViewPicker) {
+        // --- Rename sub-mode ---
+        if (state.notes.pickerSubMode == kNotesPickerRename) {
+            if (static_cast<uint8_t>(normalizedKey) == 0x1B) {
+                // Esc: cancel rename
+                state.notes.pickerSubMode = kNotesPickerNormal;
+                gNotesRenameBuffer = "";
+                state.notes.statusMessage = "rename cancelled";
+                gNotesEinkDirty = true;
+                refreshEink = true;
+                return true;
+            }
+            if (normalizedKey == '\r' || normalizedKey == '\n') {
+                // Enter: confirm rename
+                if (gNotesRenameBuffer.length() > 0) {
+                    const size_t count = notesPickerCurrentFileCount(state);
+                    if (count > 0 && state.notes.pickerIndex < count) {
+                        const String oldPath = notesPickerCurrentFilePath(state, state.notes.pickerIndex);
+                        String newName = gNotesRenameBuffer;
+                        if (!newName.endsWith(".md") && !newName.endsWith(".txt")) {
+                            newName += ".md";
+                        }
+                        const String newPath = String("/notes/") + newName;
+                        fs::FS &fs = state.notes.pickerShowSd
+                            ? static_cast<fs::FS &>(SD) : static_cast<fs::FS &>(LittleFS);
+                        if (fs.rename(oldPath, newPath)) {
+                            state.notes.statusMessage = "renamed";
+                            out.print("Notes: renamed to ");
+                            out.println(newPath);
+                        } else {
+                            state.notes.statusMessage = "rename failed";
+                        }
+                        if (state.notes.pickerShowSd) {
+                            notesRefreshPickerSdFiles(state);
+                        } else {
+                            notesRefreshPickerFiles(state);
+                        }
+                    }
+                }
+                state.notes.pickerSubMode = kNotesPickerNormal;
+                gNotesRenameBuffer = "";
+                gNotesEinkDirty = true;
+                refreshEink = true;
+                return true;
+            }
+            if (normalizedKey == 8) {
+                // Backspace
+                if (gNotesRenameBuffer.length() > 0) {
+                    gNotesRenameBuffer = gNotesRenameBuffer.substring(0, gNotesRenameBuffer.length() - 1);
+                }
+                return true;
+            }
+            if (normalizedKey >= 32 && normalizedKey <= 126) {
+                if (gNotesRenameBuffer.length() < 30) {
+                    gNotesRenameBuffer += normalizedKey;
+                }
+                return true;
+            }
+            return true;
+        }
+
+        // --- Normal picker ---
+        if (isCardKbLeftArrowCode(rawCode)) {
+            return false; // Let global handler go to launcher
+        }
+
+        const size_t fileCount = notesPickerCurrentFileCount(state);
+
+        if (isCardKbUpArrowCode(rawCode)) {
+            if (state.notes.pickerIndex > 0) {
+                --state.notes.pickerIndex;
+                if (state.notes.pickerIndex < state.notes.pickerScroll) {
+                    state.notes.pickerScroll = state.notes.pickerIndex;
+                }
+                gNotesEinkDirty = true;
+                refreshEink = true;
+            }
+            return true;
+        }
+
+        if (isCardKbDownArrowCode(rawCode)) {
+            if (fileCount > 0 && state.notes.pickerIndex < fileCount - 1) {
+                ++state.notes.pickerIndex;
+                if (state.notes.pickerIndex >= state.notes.pickerScroll + kNotesPickerVisibleOled) {
+                    state.notes.pickerScroll = state.notes.pickerIndex - kNotesPickerVisibleOled + 1;
+                }
+                gNotesEinkDirty = true;
+                refreshEink = true;
+            }
+            return true;
+        }
+
+        if (isCardKbRightArrowCode(rawCode) || normalizedKey == '\r' || normalizedKey == '\n') {
+            if (fileCount > 0) {
+                notesOpenPickerSelection(state, out);
+                gNotesEinkDirty = true;
+                refreshEink = true;
+            }
+            return true;
+        }
+
+        if (normalizedKey == 'n' || normalizedKey == 'N') {
+            notesCreateNewNote(state, out);
+            gNotesEinkDirty = true;
+            refreshEink = true;
+            return true;
+        }
+
+        if (normalizedKey == 'd' || normalizedKey == 'D') {
+            if (fileCount > 0 && state.notes.pickerIndex < fileCount) {
+                const String path = notesPickerCurrentFilePath(state, state.notes.pickerIndex);
+                fs::FS &fs = state.notes.pickerShowSd
+                    ? static_cast<fs::FS &>(SD) : static_cast<fs::FS &>(LittleFS);
+                if (fs.exists(path)) {
+                    fs.remove(path);
+                    out.print("Notes: deleted ");
+                    out.println(path);
+                    state.notes.statusMessage = "deleted";
+                }
+                if (state.notes.pickerShowSd) {
+                    notesRefreshPickerSdFiles(state);
+                } else {
+                    notesRefreshPickerFiles(state);
+                }
+                const size_t newCount = notesPickerCurrentFileCount(state);
+                if (state.notes.pickerIndex >= newCount && newCount > 0) {
+                    state.notes.pickerIndex = newCount - 1;
+                }
+                gNotesEinkDirty = true;
+                refreshEink = true;
+            }
+            return true;
+        }
+
+        if (normalizedKey == 'r' || normalizedKey == 'R') {
+            if (fileCount > 0 && state.notes.pickerIndex < fileCount) {
+                state.notes.pickerSubMode = kNotesPickerRename;
+                const String &currentName = notesPickerCurrentFileName(state, state.notes.pickerIndex);
+                // Pre-fill with current name without extension
+                gNotesRenameBuffer = notesPickerDisplayName(currentName);
+                state.notes.statusMessage = "rename: type name";
+                gNotesEinkDirty = true;
+                refreshEink = true;
+            }
+            return true;
+        }
+
+        if (normalizedKey == 'c' || normalizedKey == 'C') {
+            // Copy selected note to the other storage (FS→SD or SD→FS)
+            if (fileCount > 0 && state.notes.pickerIndex < fileCount) {
+                const String srcPath = notesPickerCurrentFilePath(state, state.notes.pickerIndex);
+                fs::FS &srcFs = state.notes.pickerShowSd
+                    ? static_cast<fs::FS &>(SD) : static_cast<fs::FS &>(LittleFS);
+                fs::FS &dstFs = state.notes.pickerShowSd
+                    ? static_cast<fs::FS &>(LittleFS) : static_cast<fs::FS &>(SD);
+                const bool dstReady = state.notes.pickerShowSd ? state.littleFsReady : state.sdReady;
+
+                if (!dstReady) {
+                    state.notes.statusMessage = "dest not ready";
+                } else {
+                    if (!dstFs.exists("/notes")) dstFs.mkdir("/notes");
+                    File src = srcFs.open(srcPath, "r");
+                    if (!src) {
+                        state.notes.statusMessage = "read failed";
+                    } else {
+                        File dst = dstFs.open(srcPath, "w");
+                        if (!dst) {
+                            state.notes.statusMessage = "write failed";
+                            src.close();
+                        } else {
+                            while (src.available()) {
+                                dst.write(static_cast<uint8_t>(src.read()));
+                            }
+                            dst.close();
+                            src.close();
+                            const String destName = state.notes.pickerShowSd ? String("LittleFS") : String("SD");
+                            state.notes.statusMessage = String("copied->") + destName;
+                            out.print("Notes: copied to ");
+                            out.println(destName);
+                        }
+                    }
+                }
+                gNotesEinkDirty = true;
+                refreshEink = true;
+            }
+            return true;
+        }
+
+        if (normalizedKey == 's' || normalizedKey == 'S') {
+            state.notes.pickerShowSd = !state.notes.pickerShowSd;
+            state.notes.pickerIndex = 0;
+            state.notes.pickerScroll = 0;
+            if (state.notes.pickerShowSd) {
+                notesRefreshPickerSdFiles(state);
+                state.notes.statusMessage = "SD notes";
+            } else {
+                notesRefreshPickerFiles(state);
+                state.notes.statusMessage = "LittleFS notes";
+            }
+            gNotesEinkDirty = true;
+            refreshEink = true;
+            return true;
+        }
+
+        // Consume other keys in picker
+        return true;
+    }
+
     ensureNotesLoaded(state, out);
     const bool writeMode = state.notes.viewMode == kNotesViewWrite;
 
-    if (normalizedKey == '\t' || static_cast<uint8_t>(normalizedKey) == 0x1B) {
+    // Esc → save + go to picker (from either mode)
+    if (static_cast<uint8_t>(normalizedKey) == 0x1B) {
+        if (state.notes.dirty) {
+            saveNotes(state, out);
+        }
+        state.notes.viewMode = kNotesViewPicker;
+        state.notes.statusMessage = "select note";
+        notesRefreshPickerFiles(state);
+        gNotesEinkDirty = true;
+        refreshEink = true;
+        return true;
+    }
+
+    // Tab → toggle write/read
+    if (normalizedKey == '\t') {
         if (state.notes.viewMode == kNotesViewRead) {
             state.notes.viewMode = kNotesViewWrite;
             state.notes.statusMessage = "mode: write";
-            notesScrollToTail(true);
+            gNotesCursorPos = gNotesBuffer.length();
+            notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
         } else {
+            if (state.notes.dirty) {
+                saveNotes(state, out);
+            }
+            refreshNotesMetadataFromBuffer();
             state.notes.viewMode = kNotesViewRead;
             state.notes.statusMessage = "mode: read";
         }
@@ -3226,96 +4395,225 @@ bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode
         return true;
     }
 
-    // Keep arrow keys out of text input path.
-    if (isCardKbLeftArrowCode(rawCode)) {
-        // Let global back handler process this key.
-        return false;
-    }
-
-    if (isCardKbRightArrowCode(rawCode)) {
-        commitNotesDraftWord(state, false);
-        saveNotes(state, out);
-        refreshNotesMetadataFromBuffer();
-        gNotesEinkDirty = true;
-        gNotesScrollBatchSteps = 0;
-        refreshEink = true;
-        return true;
-    }
-
-    if (isCardKbUpArrowCode(rawCode) || isCardKbDownArrowCode(rawCode)) {
-        const String displayText = notesComposeDisplayText(writeMode);
-        const size_t maxScroll = notesMaxScrollLine(displayText, kNotesVisibleLinesEink);
-        const bool isUp = isCardKbUpArrowCode(rawCode);
-        const size_t before = gNotesScrollLine;
-
-        if (isUp) {
-            if (gNotesScrollLine > 0) {
-                --gNotesScrollLine;
+    // --- Read mode ---
+    if (!writeMode) {
+        if (isCardKbLeftArrowCode(rawCode)) {
+            if (state.notes.dirty) {
+                saveNotes(state, out);
             }
-        } else if (gNotesScrollLine < maxScroll) {
-            ++gNotesScrollLine;
+            state.notes.viewMode = kNotesViewPicker;
+            state.notes.statusMessage = "select note";
+            notesRefreshPickerFiles(state);
+            gNotesEinkDirty = true;
+            refreshEink = true;
+            return true;
         }
 
-        state.notes.statusMessage = String("scroll ") + String(static_cast<unsigned>(gNotesScrollLine + 1)) + String("/") + String(static_cast<unsigned>(maxScroll + 1));
-        if (gNotesScrollLine != before) {
+        if (isCardKbRightArrowCode(rawCode)) {
+            saveNotes(state, out);
+            refreshNotesMetadataFromBuffer();
+            gNotesEinkDirty = true;
+            refreshEink = true;
+            return true;
+        }
+
+        if (normalizedKey == 't' || normalizedKey == 'T') {
+            if (gNotesTagCount == 0) {
+                gNotesActiveTagIndex = kNotesTagFilterAll;
+                state.notes.statusMessage = "no tags";
+            } else if (gNotesActiveTagIndex == kNotesTagFilterAll) {
+                gNotesActiveTagIndex = 0;
+                state.notes.statusMessage = notesFilterLabel();
+            } else {
+                ++gNotesActiveTagIndex;
+                if (gNotesActiveTagIndex >= static_cast<int>(gNotesTagCount)) {
+                    gNotesActiveTagIndex = kNotesTagFilterAll;
+                }
+                state.notes.statusMessage = notesFilterLabel();
+            }
+            gNotesScrollLine = 0;
+            gNotesEinkDirty = true;
+            gNotesScrollBatchSteps = 0;
+            refreshEink = true;
+            return true;
+        }
+
+        if (isCardKbUpArrowCode(rawCode) || isCardKbDownArrowCode(rawCode)) {
+            const String displayText = notesComposeFilteredDisplayText(false);
+            const size_t maxScroll = notesMaxScrollLine(displayText, kNotesVisibleLinesEink);
+            if (isCardKbUpArrowCode(rawCode)) {
+                if (gNotesScrollLine > 0) --gNotesScrollLine;
+            } else if (gNotesScrollLine < maxScroll) {
+                ++gNotesScrollLine;
+            }
+            state.notes.statusMessage = String("scroll ") + String(static_cast<unsigned>(gNotesScrollLine + 1)) + String("/") + String(static_cast<unsigned>(maxScroll + 1));
             ++gNotesScrollBatchSteps;
             const uint32_t nowMs = millis();
-            const bool thresholdReached = gNotesScrollBatchSteps >= kNotesScrollBatchThreshold;
-            const bool timeoutReached = (nowMs - gNotesLastEinkRenderMs) >= kNotesScrollBatchTimeoutMs;
-            if (thresholdReached || timeoutReached) {
+            if (gNotesScrollBatchSteps >= kNotesScrollBatchThreshold || (nowMs - gNotesLastEinkRenderMs) >= kNotesScrollBatchTimeoutMs) {
                 refreshEink = true;
                 gNotesEinkDirty = true;
                 gNotesScrollBatchSteps = 0;
             }
+            return true;
         }
-        return true;
-    }
 
-    if (!writeMode) {
-        if (normalizedKey == 8 || normalizedKey == ' ' || normalizedKey == '\r' || normalizedKey == '\n' || (normalizedKey >= 32 && normalizedKey <= 126)) {
+        // Enter in read mode: toggle checklist if on a checkbox line
+        if (normalizedKey == '\r' || normalizedKey == '\n') {
+            notesToggleChecklistAtCursor(state);
+            gNotesEinkDirty = true;
+            refreshEink = true;
+            return true;
+        }
+
+        if (normalizedKey == 8 || normalizedKey == ' ' || (normalizedKey >= 32 && normalizedKey <= 126)) {
             state.notes.statusMessage = "read only";
             return true;
         }
+        return false;
     }
 
-    if (normalizedKey == 8) {
-        if (!gNotesDraftWord.isEmpty()) {
-            gNotesDraftWord.remove(gNotesDraftWord.length() - 1);
-            state.notes.statusMessage = "typing";
-            notesScrollToTail(writeMode);
-            gNotesEinkDirty = true;
-        } else if (!gNotesBuffer.isEmpty()) {
-            gNotesBuffer.remove(gNotesBuffer.length() - 1);
-            state.notes.dirty = true;
-            state.notes.statusMessage = "edited";
-            refreshNotesMetadataFromBuffer();
-            notesScrollToTail(writeMode);
-            gNotesEinkDirty = true;
-            refreshEink = true;
-        }
-        return true;
-    }
+    // --- Write mode: cursor-based editing ---
 
-    if (normalizedKey == ' ') {
-        if (commitNotesDraftWord(state, true)) {
-            state.notes.statusMessage = "word committed";
-            notesScrollToTail(writeMode);
-            gNotesEinkDirty = true;
-            refreshEink = true;
+    // Search mode active: handle search input
+    if (gNotesSearchActive) {
+        if (static_cast<uint8_t>(normalizedKey) == 0x1B) {
+            // Esc: exit search
+            gNotesSearchActive = false;
+            gNotesSearchQuery = "";
+            gNotesSearchMatchPos = -1;
+            state.notes.statusMessage = "search off";
             return true;
         }
-
-        state.notes.statusMessage = "typing";
+        if (normalizedKey == '\r' || normalizedKey == '\n') {
+            // Enter: find next
+            notesSearchNext();
+            if (gNotesSearchMatchPos >= 0) {
+                state.notes.statusMessage = String("found @") + String(gNotesSearchMatchPos);
+                notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
+                gNotesEinkDirty = true;
+                refreshEink = true;
+            } else {
+                state.notes.statusMessage = "not found";
+            }
+            return true;
+        }
+        if (normalizedKey == 8) {
+            if (gNotesSearchQuery.length() > 0) {
+                gNotesSearchQuery = gNotesSearchQuery.substring(0, gNotesSearchQuery.length() - 1);
+            }
+            state.notes.statusMessage = String("find:") + gNotesSearchQuery;
+            return true;
+        }
+        if (normalizedKey >= 32 && normalizedKey <= 126) {
+            if (gNotesSearchQuery.length() < 20) {
+                gNotesSearchQuery += normalizedKey;
+            }
+            state.notes.statusMessage = String("find:") + gNotesSearchQuery;
+            return true;
+        }
         return true;
     }
 
-    if (isNotesEnterKey(normalizedKey, rawCode)) {
-        bool committed = commitNotesDraftWord(state, false);
-        if (gNotesBuffer.length() < kNotesMaxChars) {
-            gNotesBuffer += '\n';
+    // Ctrl+Z (0x1A) → undo
+    if (static_cast<uint8_t>(normalizedKey) == 0x1A) {
+        notesRestoreUndo(state);
+        notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
+        gNotesEinkDirty = true;
+        refreshEink = true;
+        return true;
+    }
+
+    // Ctrl+F (0x06) → search
+    if (static_cast<uint8_t>(normalizedKey) == 0x06) {
+        gNotesSearchActive = true;
+        gNotesSearchQuery = "";
+        gNotesSearchMatchPos = -1;
+        state.notes.statusMessage = "find:";
+        return true;
+    }
+
+    // Ctrl+D (0x04) → insert date/time stamp
+    if (static_cast<uint8_t>(normalizedKey) == 0x04) {
+        String stamp = getRtcTimestamp(state);
+        if (stamp.length() == 0) {
+            stamp = String("(no RTC)");
+        }
+        notesInsertStringAtCursor(stamp, state);
+        state.notes.statusMessage = "date inserted";
+        notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
+        gNotesEinkDirty = true;
+        refreshEink = true;
+        return true;
+    }
+
+    // Ctrl+T (0x14) → insert checklist item
+    if (static_cast<uint8_t>(normalizedKey) == 0x14) {
+        notesInsertStringAtCursor(String("- [ ] "), state);
+        state.notes.statusMessage = "checkbox added";
+        notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
+        gNotesEinkDirty = true;
+        refreshEink = true;
+        return true;
+    }
+
+    // Ctrl+X (0x18) → toggle checklist on current line
+    if (static_cast<uint8_t>(normalizedKey) == 0x18) {
+        notesToggleChecklistAtCursor(state);
+        gNotesEinkDirty = true;
+        refreshEink = true;
+        return true;
+    }
+
+    // Arrow keys move cursor
+    if (isCardKbLeftArrowCode(rawCode)) {
+        notesMoveCursorLeft();
+        notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
+        gNotesEinkDirty = true;
+        return true;
+    }
+
+    if (isCardKbRightArrowCode(rawCode)) {
+        notesMoveCursorRight();
+        notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
+        gNotesEinkDirty = true;
+        return true;
+    }
+
+    if (isCardKbUpArrowCode(rawCode)) {
+        notesMoveCursorUp(kNotesWrapWidthOled);
+        notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
+        gNotesEinkDirty = true;
+        return true;
+    }
+
+    if (isCardKbDownArrowCode(rawCode)) {
+        notesMoveCursorDown(kNotesWrapWidthOled);
+        notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
+        gNotesEinkDirty = true;
+        return true;
+    }
+
+    // Backspace: delete character before cursor
+    if (normalizedKey == 8) {
+        if (gNotesCursorPos > 0) {
+            notesSnapshotUndo();
+            notesDeleteAtCursor();
             state.notes.dirty = true;
-            state.notes.statusMessage = committed ? "line committed" : "new line";
-            notesScrollToTail(writeMode);
+            state.notes.statusMessage = "editing";
+            notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
+            gNotesEinkDirty = true;
+        }
+        return true;
+    }
+
+    // Enter: insert newline at cursor
+    if (isNotesEnterKey(normalizedKey, rawCode)) {
+        if (gNotesBuffer.length() < kNotesMaxChars) {
+            notesSnapshotUndo();
+            notesInsertAtCursor('\n');
+            state.notes.dirty = true;
+            state.notes.statusMessage = "new line";
+            notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
             gNotesEinkDirty = true;
             refreshEink = true;
         } else {
@@ -3324,11 +4622,14 @@ bool handleNotesAppInput(SystemState &state, char normalizedKey, uint8_t rawCode
         return true;
     }
 
-    if (normalizedKey >= 32 && normalizedKey <= 126 && normalizedKey != ' ') {
-        if (notesTotalChars() < kNotesMaxChars) {
-            gNotesDraftWord += normalizedKey;
+    // Printable characters (including space): insert at cursor
+    if (normalizedKey >= 32 && normalizedKey <= 126) {
+        if (gNotesBuffer.length() < kNotesMaxChars) {
+            notesSnapshotUndo();
+            notesInsertAtCursor(normalizedKey);
+            state.notes.dirty = true;
             state.notes.statusMessage = "typing";
-            notesScrollToTail(writeMode);
+            notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
             gNotesEinkDirty = true;
         } else {
             state.notes.statusMessage = "note full";
@@ -3360,15 +4661,26 @@ bool renderMusicPlayerScreen(SystemState &state, bool oledOnly, Stream &out) {
 }
 
 bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out) {
-    ensureNotesLoaded(state, out);
+    // Auto-save check
+    notesAutoSaveCheck(state, out);
+
+    const bool pickerMode = state.notes.viewMode == kNotesViewPicker;
+    if (!pickerMode) {
+        ensureNotesLoaded(state, out);
+    }
     const bool writeMode = state.notes.viewMode == kNotesViewWrite;
     const String modeLine = writeMode ? String("WRITE") : String("READ");
-    const String displayText = notesComposeDisplayText(writeMode);
-    const size_t totalLines = notesCountLines(displayText);
-    const size_t maxScroll = notesMaxScrollLine(displayText, kNotesVisibleLinesEink);
-    if (gNotesScrollLine > maxScroll) {
+    const String displayText = pickerMode ? String("") : notesComposeFilteredDisplayText(writeMode);
+    const size_t totalLines = pickerMode ? 0 : notesCountLines(displayText);
+    const size_t maxScroll = pickerMode ? 0 : notesMaxScrollLine(displayText, kNotesVisibleLinesEink);
+    if (!pickerMode && gNotesScrollLine > maxScroll) {
         gNotesScrollLine = maxScroll;
     }
+
+    const String noteName = notesPickerDisplayName(state.notes.filePath);
+    const String charCount = String(static_cast<unsigned>(gNotesBuffer.length() + gNotesDraftWord.length()))
+                           + String("/")
+                           + String(static_cast<unsigned>(kNotesMaxChars));
 
     if (state.oledReady && state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         gOled.clearBuffer();
@@ -3376,42 +4688,81 @@ bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out) {
         gOled.drawFrame(0, 0, 128, 64);
         gOled.drawLine(0, 13, 127, 13);
 
-        if (writeMode) {
-            const String writeText = notesComposeDisplayText(true);
-            const size_t writeTotalLines = notesCountLines(writeText);
-            const size_t startLine = writeTotalLines > kNotesVisibleLinesOled ? (writeTotalLines - kNotesVisibleLinesOled) : 0;
-            const size_t cursorLine = writeTotalLines == 0 ? 0 : (writeTotalLines - 1);
-
-            String headLine = "NOTES WRITE";
-            String posLine = String("L") + String(static_cast<unsigned>(cursorLine + 1));
+        if (pickerMode) {
+            // --- Note picker ---
+            const size_t fileCount = notesPickerCurrentFileCount(state);
+            const String storageTag = state.notes.pickerShowSd ? String("[SD]") : String("[FS]");
+            String headLine = storageTag + String(" ");
+            headLine += String(static_cast<unsigned>(fileCount));
+            headLine += " files";
             gOled.drawStr(3, 10, headLine.c_str());
-            gOled.drawStr(104, 10, posLine.c_str());
+
+            if (state.notes.pickerSubMode == kNotesPickerRename) {
+                String renameLine = String("R:") + gNotesRenameBuffer + String("_");
+                renameLine = notesClipLine(renameLine, 20);
+                gOled.drawStr(3, 21, renameLine.c_str());
+            } else {
+                gOled.drawStr(3, 21, "n d r s c ->=open");
+            }
+
+            gOled.drawFrame(2, 24, 124, 38);
+            if (fileCount == 0) {
+                gOled.drawStr(5, 37, "(no notes yet)");
+            } else {
+                for (size_t i = 0; i < kNotesPickerVisibleOled; ++i) {
+                    const size_t fileIdx = state.notes.pickerScroll + i;
+                    if (fileIdx >= fileCount) break;
+                    String label = notesPickerDisplayName(notesPickerCurrentFileName(state, fileIdx));
+                    const bool selected = fileIdx == state.notes.pickerIndex;
+                    String displayLine = selected ? String(">") + label : String(" ") + label;
+                    displayLine = notesClipLine(displayLine, 19);
+                    const int y = 33 + static_cast<int>(i) * 9;
+                    gOled.drawStr(5, y, displayLine.c_str());
+                }
+            }
+        } else if (writeMode) {
+            // Cursor-based write mode with visual wrapping
+            size_t vLine, vCol;
+            notesCursorVisualPos(kNotesWrapWidthOled, vLine, vCol);
+            notesScrollToCursorVisual(kNotesVisibleLinesOled, kNotesWrapWidthOled);
+
+            String headLine = notesClipLine(noteName, 10);
+            headLine += state.notes.dirty ? " W*" : " W";
+            gOled.drawStr(3, 10, headLine.c_str());
+            gOled.drawStr(80, 10, charCount.c_str());
 
             String statusShort = notesClipLine(state.notes.statusMessage, 20);
             gOled.drawStr(3, 21, statusShort.c_str());
 
             gOled.drawFrame(2, 24, 124, 38);
             for (size_t i = 0; i < kNotesVisibleLinesOled; ++i) {
-                const size_t lineIndex = startLine + i;
-                String line = notesLineAt(writeText, lineIndex);
-                line = notesClipLine(line.isEmpty() ? String(" ") : line, 19);
-                if (lineIndex == cursorLine) {
-                    line += "_";
+                const size_t lineIndex = gNotesScrollLine + i;
+                String line = notesWrappedLineAt(kNotesWrapWidthOled, lineIndex);
+                if (lineIndex == vLine) {
+                    if (vCol <= line.length()) {
+                        line = line.substring(0, vCol) + String("_") + line.substring(vCol);
+                    } else {
+                        line += "_";
+                    }
                 }
+                line = notesClipLine(line.isEmpty() ? String(" ") : line, 20);
 
                 const int y = 33 + static_cast<int>(i) * 9;
                 gOled.drawStr(5, y, line.c_str());
             }
         } else {
-            String headLine = String("NOTES ") + modeLine;
+            String headLine = notesClipLine(noteName, 10);
+            headLine += state.notes.dirty ? " R*" : " R";
             String posLine = String(static_cast<unsigned>(gNotesScrollLine + 1)) + String("/") + String(static_cast<unsigned>(totalLines));
             const size_t oledMaxScroll = notesMaxScrollLine(displayText, kNotesVisibleLinesOled);
 
             gOled.drawStr(3, 10, headLine.c_str());
             gOled.drawStr(98, 10, posLine.c_str());
 
-            String statusShort = notesClipLine(state.notes.statusMessage, 20);
+            String statusShort = notesClipLine(state.notes.statusMessage, 12);
             gOled.drawStr(3, 21, statusShort.c_str());
+            String filterShort = notesClipLine(notesFilterLabel(), 12);
+            gOled.drawStr(68, 21, filterShort.c_str());
 
             gOled.drawFrame(2, 24, 118, 38);
             for (size_t i = 0; i < kNotesVisibleLinesOled; ++i) {
@@ -3448,7 +4799,12 @@ bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out) {
         return state.oledReady;
     }
 
-    const uint32_t viewportSig = notesViewportSignature(displayText, writeMode, gNotesScrollLine);
+    const size_t pickerFileCount = pickerMode ? notesPickerCurrentFileCount(state) : 0;
+    const uint32_t viewportSig = pickerMode
+        ? static_cast<uint32_t>(pickerFileCount * 100 + state.notes.pickerIndex
+            + (state.notes.pickerShowSd ? 50000 : 0)
+            + (state.notes.pickerSubMode == kNotesPickerRename ? 25000 : 0))
+        : notesViewportSignature(displayText, writeMode, gNotesScrollLine);
     if (!gNotesEinkDirty && viewportSig == gNotesLastViewportSignature) {
         noteDisplayActivity();
         return true;
@@ -3460,65 +4816,131 @@ bool renderNotesScreen(SystemState &state, bool oledOnly, Stream &out) {
         paint.Clear(kUncolored);
         paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
 
-        String topLine = String("NOTES ") + modeLine;
-        String posLine = String("line ") + String(static_cast<unsigned>(gNotesScrollLine + 1)) + String("/") + String(static_cast<unsigned>(totalLines));
-        String statusLine = notesClipLine(state.notes.statusMessage, 62);
-        paint.DrawStringAtUtf8(8, 12, topLine.c_str(), &Font16, kColored);
-        paint.DrawStringAtUtf8(188, 12, posLine.c_str(), &Font12, kColored);
-        paint.DrawLine(0, 20, kEinkLandscapeWidth - 1, 20, kColored);
-        paint.DrawStringAtUtf8(8, 34, statusLine.c_str(), &Font12, kColored);
+        if (pickerMode) {
+            // --- E-ink picker ---
+            const size_t fileCount = notesPickerCurrentFileCount(state);
+            const String storageTag = state.notes.pickerShowSd ? String("[SD]") : String("[LittleFS]");
+            String topLine = storageTag + String("  ") + String(static_cast<unsigned>(fileCount)) + String(" files");
+            paint.DrawStringAtUtf8(8, 12, topLine.c_str(), &Font16, kColored);
+            paint.DrawLine(0, 20, kEinkLandscapeWidth - 1, 20, kColored);
 
-        const int textLeft = 8;
-        const int textTop = 42;
-        const int textRight = kEinkLandscapeWidth - 18;
-        const int textBottom = 196;
-        paint.DrawRectangle(textLeft - 2, textTop - 4, textRight + 2, textBottom, kColored);
-
-        int y = 56;
-        const int textInnerBottom = textBottom - 4;
-        const size_t cursorLineIndex = writeMode ? (totalLines == 0 ? 0 : totalLines - 1) : 0;
-        for (size_t i = 0; i < kNotesVisibleLinesEink && y <= 186; ++i) {
-            const size_t lineIndex = gNotesScrollLine + i;
-            String line = notesLineAt(displayText, lineIndex);
-            const uint8_t level = writeMode ? 0 : notesHeadingLevel(line);
-            if (!writeMode) {
-                line = notesStyleLineForBrowse(line);
-            }
-            const bool largeHeading = !writeMode && level > 0 && level <= 2;
-            const int lineAdvance = largeHeading ? 20 : 16;
-            if (y + lineAdvance > textInnerBottom) {
-                break;
-            }
-
-            line = notesClipLine(line.isEmpty() ? String(" ") : line, largeHeading ? 42 : 52);
-            if (writeMode && lineIndex == cursorLineIndex) {
-                line += "_";
-            }
-
-            if (largeHeading) {
-                paint.DrawStringAtUtf8(textLeft, y, line.c_str(), &Font16, kColored);
+            if (state.notes.pickerSubMode == kNotesPickerRename) {
+                String renameLine = String("Rename: ") + gNotesRenameBuffer + String("_");
+                renameLine = notesClipLine(renameLine, 52);
+                paint.DrawStringAt(8, 34, renameLine.c_str(), &Font12, kColored);
             } else {
-                paint.DrawStringAtUtf8(textLeft, y, line.c_str(), &Font12, kColored);
+                paint.DrawStringAt(8, 34, "n=new d=del r=rename s=SD/FS c=copy", &Font12, kColored);
             }
 
-            y += lineAdvance;
-        }
+            const int textLeft = 8;
+            const int textTop = 42;
+            const int textRight = kEinkLandscapeWidth - 18;
+            const int textBottom = 196;
+            paint.DrawRectangle(textLeft - 2, textTop - 4, textRight + 2, textBottom, kColored);
 
-        // Right-side scrollbar.
-        const int sbX = kEinkLandscapeWidth - 12;
-        const int sbY = textTop;
-        const int sbH = textBottom - textTop - 4;
-        paint.DrawRectangle(sbX, sbY, sbX + 6, sbY + sbH, kColored);
-        int sbThumbY = sbY + 2;
-        const int sbThumbH = 12;
-        if (maxScroll > 0) {
-            sbThumbY = sbY + 2 + static_cast<int>(((sbH - 4 - sbThumbH) * gNotesScrollLine) / maxScroll);
+            if (fileCount == 0) {
+                paint.DrawStringAt(textLeft, 70, "(no notes yet - press N to create)", &Font12, kColored);
+            } else {
+                int py = 56;
+                for (size_t i = 0; i < kNotesVisibleLinesEink && py <= 186; ++i) {
+                    const size_t fileIdx = state.notes.pickerScroll + i;
+                    if (fileIdx >= fileCount) break;
+                    const bool selected = fileIdx == state.notes.pickerIndex;
+                    String label = selected ? String("> ") : String("  ");
+                    label += notesPickerCurrentFileName(state, fileIdx);
+                    label = notesClipLine(label, 52);
+                    paint.DrawStringAt(textLeft, py, label.c_str(), &Font12, kColored);
+                    py += 16;
+                }
+            }
+        } else {
+            String topLine = noteName + (writeMode
+                ? (state.notes.dirty ? String(" WRITE*") : String(" WRITE"))
+                : (state.notes.dirty ? String(" READ*") : String(" READ")));
+            topLine = notesClipLine(topLine, 28);
+            String posLine = String("line ") + String(static_cast<unsigned>(gNotesScrollLine + 1)) + String("/") + String(static_cast<unsigned>(totalLines));
+            String statusLine = charCount + String("  ") + notesClipLine(state.notes.statusMessage, 40);
+            paint.DrawStringAtUtf8(8, 12, topLine.c_str(), &Font16, kColored);
+            paint.DrawStringAtUtf8(188, 12, posLine.c_str(), &Font12, kColored);
+            paint.DrawLine(0, 20, kEinkLandscapeWidth - 1, 20, kColored);
+            paint.DrawStringAtUtf8(8, 34, statusLine.c_str(), &Font12, kColored);
+
+            const int textLeft = 8;
+            const int textTop = 42;
+            const int textRight = kEinkLandscapeWidth - 18;
+            const int textBottom = 196;
+            paint.DrawRectangle(textLeft - 2, textTop - 4, textRight + 2, textBottom, kColored);
+
+            // For e-ink write mode: compute visual scroll independently
+            size_t einkScrollLine = gNotesScrollLine;
+            size_t eVLine = 0, eVCol = 0;
+            if (writeMode) {
+                notesCursorVisualPos(kNotesWrapWidthEink, eVLine, eVCol);
+                if (eVLine < einkScrollLine) {
+                    einkScrollLine = eVLine;
+                } else if (eVLine >= einkScrollLine + kNotesVisibleLinesEink) {
+                    einkScrollLine = eVLine - kNotesVisibleLinesEink + 1;
+                }
+            }
+
+            int y = 56;
+            const int textInnerBottom = textBottom - 4;
+            for (size_t i = 0; i < kNotesVisibleLinesEink && y <= 186; ++i) {
+                const size_t lineIndex = (writeMode ? einkScrollLine : gNotesScrollLine) + i;
+                String line = writeMode
+                    ? notesWrappedLineAt(kNotesWrapWidthEink, lineIndex)
+                    : notesLineAt(displayText, lineIndex);
+
+                if (writeMode && lineIndex == eVLine) {
+                    if (eVCol <= line.length()) {
+                        line = line.substring(0, eVCol) + String("_") + line.substring(eVCol);
+                    } else {
+                        line += "_";
+                    }
+                }
+
+                const uint8_t level = !writeMode ? notesHeadingLevel(line) : 0;
+                if (!writeMode) {
+                    line = notesStyleLineForBrowse(line);
+                }
+                const bool largeHeading = level > 0 && level <= 2;
+                const int lineAdvance = largeHeading ? 20 : 16;
+                if (y + lineAdvance > textInnerBottom) {
+                    break;
+                }
+
+                line = notesClipLine(line.isEmpty() ? String(" ") : line, largeHeading ? 42 : 52);
+
+                if (largeHeading) {
+                    paint.DrawStringAtUtf8(textLeft, y, line.c_str(), &Font16, kColored);
+                } else {
+                    paint.DrawStringAtUtf8(textLeft, y, line.c_str(), &Font12, kColored);
+                }
+
+                y += lineAdvance;
+            }
+
+            // Right-side scrollbar.
+            const int sbX = kEinkLandscapeWidth - 12;
+            const int sbY = textTop;
+            const int sbH = textBottom - textTop - 4;
+            paint.DrawRectangle(sbX, sbY, sbX + 6, sbY + sbH, kColored);
+            int sbThumbY = sbY + 2;
+            const int sbThumbH = 12;
+            if (maxScroll > 0) {
+                sbThumbY = sbY + 2 + static_cast<int>(((sbH - 4 - sbThumbH) * gNotesScrollLine) / maxScroll);
+            }
+            paint.DrawRectangle(sbX + 1, sbThumbY, sbX + 5, sbThumbY + sbThumbH, kColored);
         }
-        paint.DrawRectangle(sbX + 1, sbThumbY, sbX + 5, sbThumbY + sbThumbH, kColored);
 
         paint.DrawLine(0, 206, kEinkLandscapeWidth - 1, 206, kColored);
-        paint.DrawStringAt(8, 220, "up/down=scroll enter=new line ->=save", &Font12, kColored);
-        paint.DrawStringAt(8, 236, "tab/esc=read/write <- back", &Font12, kColored);
+        if (pickerMode) {
+            paint.DrawStringAt(8, 220, "n=new d=del r=rename s=SD/FS c=copy", &Font12, kColored);
+            paint.DrawStringAt(8, 236, "up/dn=nav  enter=open  left=launcher", &Font12, kColored);
+        } else {
+            paint.DrawStringAt(8, 220, "^F=find ^D=date ^T=todo ^X=toggle ^Z=undo", &Font12, kColored);
+            paint.DrawStringAt(8, 236, "tab=mode esc=list enter=check(read) t=tag", &Font12, kColored);
+        }
 
         gEink.display(paint.GetImage());
         refreshEinkWithCadence(false);
@@ -3826,49 +5248,146 @@ bool renderStatusScreen(SystemState &state, const String &title, const String &l
     return true;
 }
 
-bool renderDesktopScreen(SystemState &state, bool oledOnly, Stream &out) {
-    if (state.oledReady && state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        const bool notifStripVisible = state.notifications.viewMode == 1;
-        const int panelWidth = 42;  // ~1/3 of 128px OLED width.
-        const int contentWidth = 128;
-        const int contentStartX = 0;
-        const char *artLines[] = {
-R"( ▄▀▀▄ ▀▄  ▄▀▀▀▀▄   ▄▀▀▀█▀▀▄  ▄▀▀█▄▄▄▄  ▄▀▀▄    ▄▀▀▄  ▄▀▀█▄   ▄▀▀▄    ▄▀▀▄  ▄▀▀█▄▄▄▄ )",
-R"(█  █ █ █ █      █ █    █  ▐ ▐  ▄▀   ▐ █   █    ▐  █ ▐ ▄▀ ▀▄ █   █    ▐  █ ▐  ▄▀   ▐ )",
-R"(▐  █  ▀█ █      █ ▐   █       █▄▄▄▄▄  ▐  █        █   █▄▄▄█ ▐  █        █   █▄▄▄▄▄  )",
-R"(  █   █  ▀▄    ▄▀    █        █    ▌    █   ▄    █   ▄▀   █   █   ▄    █    █    ▌  )",
-R"(▄▀   █     ▀▀▀▀    ▄▀        ▄▀▄▄▄▄      ▀▄▀ ▀▄ ▄▀  █   ▄▀     ▀▄▀ ▀▄ ▄▀   ▄▀▄▄▄▄   )",
-R"(█    ▐            █          █    ▐            ▀    ▐   ▐            ▀     █    ▐   )",
-R"(▐                 ▐          ▐                                             ▐        )"
-        };
-        const size_t artLineCount = sizeof(artLines) / sizeof(artLines[0]);
-        const int lineHeight = 8;
-        const int artHeight = static_cast<int>(artLineCount) * lineHeight;
-        const int artStartY = max(10, (64 - artHeight) / 2 + 6);
+// --- Desktop terminal input handler ---
+bool handleDesktopTerminalInput(SystemState &state, char normalizedKey, uint8_t rawCode, bool &refreshEink, Stream &out) {
+    refreshEink = false;
 
+    // Esc: clear terminal
+    if (static_cast<uint8_t>(normalizedKey) == 0x1B) {
+        gTermLineCount = 0;
+        gTermScroll = 0;
+        gTermInputBuffer = "";
+        gTermEinkDirty = true;
+        refreshEink = true;
+        return true;
+    }
+
+    // Up arrow: scroll up
+    if (isCardKbUpArrowCode(rawCode)) {
+        if (gTermScroll > 0) {
+            --gTermScroll;
+            gTermEinkDirty = true;
+        }
+        return true;
+    }
+
+    // Down arrow: scroll down
+    if (isCardKbDownArrowCode(rawCode)) {
+        if (gTermLineCount > kTermVisibleOled && gTermScroll < gTermLineCount - kTermVisibleOled) {
+            ++gTermScroll;
+            gTermEinkDirty = true;
+        }
+        return true;
+    }
+
+    // Backspace
+    if (normalizedKey == 8) {
+        if (gTermInputBuffer.length() > 0) {
+            gTermInputBuffer = gTermInputBuffer.substring(0, gTermInputBuffer.length() - 1);
+        }
+        return true;
+    }
+
+    // Enter: execute command
+    if (normalizedKey == '\r' || normalizedKey == '\n') {
+        if (gTermInputBuffer.length() > 0) {
+            // Show the command in terminal
+            termAddLine(String("$ ") + gTermInputBuffer);
+
+            // Execute via shell
+            if (gTermTaskManager) {
+                StringStream capture;
+                executeShellCommand(state, *gTermTaskManager, gTermInputBuffer, capture);
+                if (capture.buffer.length() > 0) {
+                    termAddOutput(capture.buffer);
+                }
+            } else {
+                termAddLine("(no task manager)");
+            }
+
+            gTermInputBuffer = "";
+            gTermEinkDirty = true;
+            refreshEink = true;
+        }
+        return true;
+    }
+
+    // Printable characters
+    if (normalizedKey >= 32 && normalizedKey <= 126) {
+        if (gTermInputBuffer.length() < 60) {
+            gTermInputBuffer += normalizedKey;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// --- Fastfetch-style system info ---
+String desktopUptimeString() {
+    const uint32_t ms = millis();
+    const uint32_t secs = ms / 1000;
+    const uint32_t mins = secs / 60;
+    const uint32_t hrs = mins / 60;
+    if (hrs > 0) {
+        return String(hrs) + "h " + String(mins % 60) + "m";
+    }
+    return String(mins) + "m " + String(secs % 60) + "s";
+}
+
+String desktopHeapString() {
+    const uint32_t freeK = ESP.getFreeHeap() / 1024;
+    const uint32_t totalK = ESP.getHeapSize() / 1024;
+    return String(freeK) + "K / " + String(totalK) + "K";
+}
+
+String desktopFlashString() {
+    const uint32_t totalM = ESP.getFlashChipSize() / (1024 * 1024);
+    return String(totalM) + "MB " + String(ESP.getFlashChipSpeed() / 1000000) + "MHz";
+}
+
+bool renderDesktopScreen(SystemState &state, bool oledOnly, Stream &out) {
+    // Show fastfetch on first boot if terminal is empty
+    if (gTermLineCount == 0) {
+        termAddLine(state.config.deviceName + "@esp32s3");
+        termAddLine("----------------");
+        termAddLine("OS: NoteWave OS");
+        termAddLine("CPU: ESP32-S3 " + String(ESP.getCpuFreqMHz()) + "MHz");
+        termAddLine("Heap: " + desktopHeapString());
+        termAddLine("Up: " + desktopUptimeString());
+        String flags;
+        flags += state.sdReady ? "SD " : "";
+        flags += state.littleFsReady ? "FS " : "";
+        flags += state.rtcReady ? "RTC " : "";
+        flags += state.cardKbReady ? "KB " : "";
+        flags += state.oledReady ? "OLED " : "";
+        flags += state.einkReady ? "EINK" : "";
+        termAddLine(flags);
+        termAddLine("");
+    }
+
+    // --- OLED: terminal view ---
+    if (state.oledReady && state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         gOled.clearBuffer();
         gOled.setFont(u8g2_font_4x6_tf);
-        for (size_t i = 0; i < artLineCount; ++i) {
-            const int lineWidth = static_cast<int>(String(artLines[i]).length()) * 4;
-            const int x = contentStartX + max(0, (contentWidth - lineWidth) / 2);
-            const int y = artStartY + static_cast<int>(i) * lineHeight;
-            gOled.drawStr(x, y, artLines[i]);
+
+        // Output lines
+        int y = 7;
+        for (size_t i = 0; i < kTermVisibleOled; ++i) {
+            const size_t lineIdx = gTermScroll + i;
+            if (lineIdx < gTermLineCount) {
+                String line = gTermLines[lineIdx];
+                if (line.length() > 30) line = line.substring(0, 30);
+                gOled.drawStr(0, y, line.c_str());
+            }
+            y += 8;
         }
 
-        if (notifStripVisible) {
-            const int panelX = 128 - panelWidth;
-            gOled.setDrawColor(0);
-            gOled.drawBox(panelX, 0, panelWidth, 64);
-            gOled.setDrawColor(1);
-            gOled.drawFrame(panelX, 0, panelWidth, 64);
-            gOled.drawLine(panelX, 0, panelX, 63);
-            gOled.setFont(u8g2_font_4x6_tf);
-            gOled.drawStr(panelX + 2, 8, "NOTIF");
-            gOled.drawStr(panelX + 2, 20, "doprava");
-            gOled.drawStr(panelX + 2, 28, "= full");
-            gOled.drawStr(panelX + 2, 40, "doleva");
-            gOled.drawStr(panelX + 2, 48, "= zavrit");
-        }
+        // Input prompt at bottom
+        gOled.drawLine(0, 55, 127, 55);
+        String prompt = String("$ ") + gTermInputBuffer + "_";
+        if (prompt.length() > 30) prompt = prompt.substring(prompt.length() - 30);
+        gOled.drawStr(0, 63, prompt.c_str());
 
         gOled.sendBuffer();
         xSemaphoreGive(state.spiMutex);
@@ -3882,54 +5401,50 @@ R"(▐                 ▐          ▐                                         
         return state.oledReady;
     }
 
-    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-        const bool notifStripVisible = state.notifications.viewMode == 1;
-        const int panelWidth = kEinkLandscapeWidth / 3;
-        const int panelX = kEinkLandscapeWidth - panelWidth;
-        const int contentStartX = 0;
-        const int contentWidth = kEinkLandscapeWidth;
-        constexpr int kArtGlyphAdvance = 4;
-        const char *artLines[] = {
-R"( ▄▀▀▄ ▀▄  ▄▀▀▀▀▄   ▄▀▀▀█▀▀▄  ▄▀▀█▄▄▄▄  ▄▀▀▄    ▄▀▀▄  ▄▀▀█▄   ▄▀▀▄    ▄▀▀▄  ▄▀▀█▄▄▄▄ )",
-R"(█  █ █ █ █      █ █    █  ▐ ▐  ▄▀   ▐ █   █    ▐  █ ▐ ▄▀ ▀▄ █   █    ▐  █ ▐  ▄▀   ▐ )",
-R"(▐  █  ▀█ █      █ ▐   █       █▄▄▄▄▄  ▐  █        █   █▄▄▄█ ▐  █        █   █▄▄▄▄▄  )",
-R"(  █   █  ▀▄    ▄▀    █        █    ▌    █   ▄    █   ▄▀   █   █   ▄    █    █    ▌  )",
-R"(▄▀   █     ▀▀▀▀    ▄▀        ▄▀▄▄▄▄      ▀▄▀ ▀▄ ▄▀  █   ▄▀     ▀▄▀ ▀▄ ▄▀   ▄▀▄▄▄▄   )",
-R"(█    ▐            █          █    ▐            ▀    ▐   ▐            ▀     █    ▐   )",
-R"(▐                 ▐          ▐                                             ▐        )"
-        };
-        const size_t artLineCount = sizeof(artLines) / sizeof(artLines[0]);
-        const int lineHeight = 10;
-        const int artHeight = static_cast<int>(artLineCount) * lineHeight;
-        const int artStartY = max(56, (kEinkLandscapeHeight - artHeight) / 2);
+    if (!gTermEinkDirty) {
+        noteDisplayActivity();
+        return true;
+    }
 
+    // --- E-ink: full terminal view ---
+    if (state.spiMutex && xSemaphoreTake(state.spiMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
         Paint paint(gEinkBuffer, kEinkNativeWidth, kEinkNativeHeight);
         prepareLandscapePaint(paint);
         paint.Clear(kUncolored);
         paint.DrawRectangle(0, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
-        paint.DrawStringAt(8, 10, "NOTEWAVE", &Font16, kColored);
-        paint.DrawLine(0, 32, kEinkLandscapeWidth - 1, 32, kColored);
 
-        const size_t maxGlyphsPerLine = max<size_t>(1, static_cast<size_t>(contentWidth / kArtGlyphAdvance));
-        for (size_t i = 0; i < artLineCount; ++i) {
-            String line = utf8ClipToGlyphs(artLines[i], maxGlyphsPerLine);
-            const int lineWidth = static_cast<int>(utf8GlyphCount(line.c_str()) * kArtGlyphAdvance);
-            const int x = contentStartX + max(0, (contentWidth - lineWidth) / 2);
-            const int y = artStartY + static_cast<int>(i) * lineHeight;
-            paint.DrawStringAtUtf8Compact(x, y, line.c_str(), &Font8, kColored, kArtGlyphAdvance);
+        // Title bar
+        String titleBar = state.config.deviceName + "@esp32s3 ~ shell";
+        paint.DrawStringAt(8, 10, titleBar.c_str(), &Font16, kColored);
+        paint.DrawLine(0, 28, kEinkLandscapeWidth - 1, 28, kColored);
+
+        // Terminal output lines
+        // Compute e-ink scroll: show latest lines
+        size_t einkScroll = 0;
+        if (gTermLineCount > kTermVisibleEink) {
+            einkScroll = gTermLineCount - kTermVisibleEink;
         }
 
-        if (notifStripVisible) {
-            paint.DrawFilledRectangle(panelX, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kUncolored);
-            paint.DrawRectangle(panelX, 0, kEinkLandscapeWidth - 1, kEinkLandscapeHeight - 1, kColored);
-            paint.DrawLine(panelX, 0, panelX, kEinkLandscapeHeight - 1, kColored);
-            paint.DrawStringAt(panelX + 8, 18, "UPOZORNENI", &Font12, kColored);
-            paint.DrawStringAt(panelX + 8, 40, "doprava=full", &Font12, kColored);
-            paint.DrawStringAt(panelX + 8, 58, "doleva=zavrit", &Font12, kColored);
+        int y = 38;
+        for (size_t i = 0; i < kTermVisibleEink; ++i) {
+            const size_t lineIdx = einkScroll + i;
+            if (lineIdx < gTermLineCount) {
+                String line = gTermLines[lineIdx];
+                if (line.length() > kTermMaxLineLen) line = line.substring(0, kTermMaxLineLen);
+                paint.DrawStringAt(8, y, line.c_str(), &Font12, kColored);
+            }
+            y += 15;
         }
+
+        // Input prompt
+        paint.DrawLine(0, 220, kEinkLandscapeWidth - 1, 220, kColored);
+        String prompt = String("$ ") + gTermInputBuffer + "_";
+        if (prompt.length() > kTermMaxLineLen) prompt = prompt.substring(prompt.length() - kTermMaxLineLen);
+        paint.DrawStringAt(8, 232, prompt.c_str(), &Font12, kColored);
 
         gEink.display(paint.GetImage());
         refreshEinkWithCadence(false);
+        gTermEinkDirty = false;
         xSemaphoreGive(state.spiMutex);
     }
 
@@ -3962,9 +5477,32 @@ bool renderActiveApp(SystemState &state, bool oledOnly, Stream &out) {
     return appRouterRenderActiveApp(state, oledOnly, out, context);
 }
 
+void setDesktopTaskManager(TaskManager *tm) {
+    gTermTaskManager = tm;
+}
+
 bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
     // Decode CardKB-specific encodings before app-level routing.
     const uint8_t rawCode = static_cast<uint8_t>(key);
+
+    // Desktop terminal gets first crack at input (except left-arrow → launcher).
+    if (state.launcher.activeAppId.equalsIgnoreCase("desktop")) {
+        // Left arrow exits to launcher
+        if (isCardKbLeftArrowCode(rawCode)) {
+            state.notifications.viewMode = 0;
+            state.launcher.activeAppId = "launcher";
+            state.settings.lastMessage = "launcher";
+            renderLauncherScreen(state, false, out);
+            return true;
+        }
+        const char desktopNormalizedKey = decodeCardKbKey(key);
+        bool refreshEink = false;
+        if (handleDesktopTerminalInput(state, desktopNormalizedKey, rawCode, refreshEink, out)) {
+            renderDesktopScreen(state, !refreshEink, out);
+            return true;
+        }
+    }
+
     AppRouterInputContext inputContext;
     inputContext.isLeftArrowCode = isCardKbLeftArrowCode;
     inputContext.isDownArrowCode = isCardKbDownArrowCode;
@@ -4010,6 +5548,7 @@ bool handleActiveAppInput(SystemState &state, char key, Stream &out) {
             renderNotesScreen(state, !refreshNotesEink, out);
             return true;
         }
+        // Left arrow in picker mode falls through to global back handler (→ launcher)
     }
 
     if (appRouterHandleBackInput(

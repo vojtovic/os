@@ -135,6 +135,20 @@ bool tryReadCardKb(SystemState &state, char &ch) {
     return success;
 }
 
+String getRtcTimestamp(const SystemState &state) {
+    if (!state.rtcReady || !state.i2cMutex) return String();
+    String result;
+    if (xSemaphoreTake(state.i2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        const DateTime now = gRtc.now();
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d",
+                 now.year(), now.month(), now.day(), now.hour(), now.minute());
+        result = String(buf);
+        xSemaphoreGive(state.i2cMutex);
+    }
+    return result;
+}
+
 bool printRtcNow(const SystemState &state, Stream &out) {
     if (!state.rtcReady || !state.i2cMutex) {
         out.println("RTC not ready");

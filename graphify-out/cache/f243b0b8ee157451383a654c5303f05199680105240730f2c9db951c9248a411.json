@@ -1,0 +1,1 @@
+{"nodes": [{"id": "include_apptasks_h", "label": "AppTasks.h", "file_type": "code", "source_file": "include/AppTasks.h", "source_location": "L1"}], "edges": [{"source": "include_apptasks_h", "target": "systemstate", "relation": "imports", "confidence": "EXTRACTED", "source_file": "include/AppTasks.h", "source_location": "L3", "weight": 1.0}], "raw_calls": []}

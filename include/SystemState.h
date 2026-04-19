@@ -35,6 +35,10 @@ struct NotesState {
     bool loaded = false;
     bool dirty = false;
     uint8_t viewMode = 0;
+    uint8_t pickerIndex = 0;
+    uint8_t pickerScroll = 0;
+    uint8_t pickerSubMode = 0; // 0=normal, 1=rename
+    bool pickerShowSd = false; // true=showing SD notes, false=LittleFS
 };
 
 struct SettingsState {
@@ -63,9 +67,11 @@ struct FileManagerState {
     String clipboardPath = "";
     String menuTargetPath = "";
     String pendingFolderName = "";
+    String pendingRenameName = "";
     bool clipboardActive = false;
     bool clipboardMove = false;
     bool menuTargetIsDir = false;
+    bool browseLittleFs = false;  // false=SD, true=LittleFS
     uint8_t viewMode = 0;
     uint8_t selectedIndex = 0;
     size_t scrollOffset = 0;

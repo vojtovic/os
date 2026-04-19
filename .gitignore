@@ -17,3 +17,5 @@ compile_commands.json
 
 # Local Copilot custom agents
 .github/agents/
+.claude/commands/
+

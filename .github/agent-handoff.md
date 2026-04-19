@@ -3,7 +3,26 @@
 Use this file as the shared context between agents in this workspace.
 
 ## Current Objective
-- Next focus: design the music-player app path with SD-backed content so the firmware stays small and the launcher can expose it cleanly.
+- Notes app: add Obsidian live-preview markdown in write mode — committed lines styled (# → H1, - → bullet, etc.), cursor line stays raw so you see syntax while typing.
+
+## Execution Plan (Notes App Improvements)
+1. Strategy: add note picker, bigger buffer, char counter, auto-save, and live-preview markdown.
+2. Build: implemented all features in DisplayManager.cpp and SystemState.h.
+3. Verify: platformio run.
+4. Review: confirm picker nav, file create/delete, mode switching, auto-save.
+
+## Stage Status (Notes App Improvements)
+- Live preview: done, evidence: notesStyleLineForBrowse() applied to committed lines in write mode; cursor line stays raw.
+- Note picker: done, evidence: new kNotesViewPicker mode with file listing, create (n), delete (d), open (enter/right).
+- Buffer upgrade: done, evidence: kNotesMaxChars bumped from 1200 to 4096.
+- Char counter: done, evidence: header now shows filename + chars used/max.
+- Auto-save: done, evidence: write→read mode switch auto-saves dirty notes.
+- Forward decl fix: done, evidence: added missing notesLineContainsTag forward declaration.
+- Cursor editing: done, evidence: full cursor movement with all 4 arrows in write mode, insert/delete at cursor position.
+- Raw write mode: done, evidence: write mode shows raw `# heading` syntax, read mode renders styled `H1 heading`.
+- Space as text: done, evidence: space inserts a space character at cursor, no more word-commit behavior.
+- Key remapping: done, evidence: Tab=toggle write/read, Esc=save+picker, arrows=cursor(write)/scroll(read).
+- Verify: done, evidence: platformio run SUCCESS (2026-04-18), RAM 27.1%, Flash 28.9%.
 
 ## Execution Plan (Direct HTTPS Web Explorer)
 1. Strategy: replace HTTP-only web upload serving with direct HTTPS on ESP so no always-on external proxy is required.
@@ -248,6 +267,18 @@ Use this file as the shared context between agents in this workspace.
 ## Stage Status (Keyboard Regression Triage)
 - Strategy: done, evidence: user reports keyboard non-functional after recent work, next stage: ideas.
 - Build: done, evidence: implemented `settingsServiceForgetWifi` and wired it through settings input context plus OLED/e-ink WiFi manager hints, next stage: verify.
+
+## Execution Plan (Notes App Completion)
+1. Strategy: define minimum complete Notes MVP in current firmware architecture (list, view/edit, save to storage, safe navigation).
+2. Ideas: choose low-risk storage path and input UX compatible with CardKB and existing left-arrow back convention.
+3. Build: wire notes app into launcher/router, add state + rendering + input handling, and persist notes data via existing storage facilities.
+4. Verify: run `platformio run` and fix any compile/runtime-facing issues.
+5. Review: check regressions in launcher navigation, serial shell behavior, and shared display/SPI safety.
+6. Optimize: identify low-risk performance and UX improvements for notes list loading and redraw cadence.
+7. Explain: summarize what changed, known limitations, and next validation steps.
+
+## Stage Status (Notes App Completion)
+- Strategy: in-progress, evidence: user requested to finish the notes app end-to-end in current firmware workspace, next stage: ideas.
 - Verify: done, evidence: `platformio run` SUCCESS (2026-04-10) after forget-network patch set, next stage: review.
 - Review: done, evidence: connect/scan/toggle paths are unchanged and saved-password prefill remains tied to exact SSID match, next stage: explain.
 

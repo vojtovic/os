@@ -153,6 +153,7 @@ void setupApplication(SystemState &state, TaskManager &taskManager) {
         Serial.println("CardKB live logging: enabled");
     }
 
+    setDesktopTaskManager(&taskManager);
     renderActiveApp(state, false, Serial);
 }
 
